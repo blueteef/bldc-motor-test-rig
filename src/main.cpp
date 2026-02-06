@@ -51,6 +51,7 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
+#include "log_csv.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <math.h>
@@ -536,24 +537,14 @@ bool startLogging()
   char fname[16];
   snprintf(fname, sizeof(fname), "/RUN%04lu.CSV", (unsigned long)runNumber);
 
-  digitalWrite(TFT_CS, HIGH);
-  digitalWrite(SD_CS, LOW);
-  logFile = SD.open(fname, FILE_WRITE);
-  digitalWrite(SD_CS, HIGH);
-  digitalWrite(TFT_CS, LOW);
-
-  if (!logFile)
-  {
+  if(!logCsvOpen(fname, TFT_CS, SD_CS, writeRunHeader)){
     statusBar("LOG OPEN FAIL", C_BAD);
     Serial.println("ERR log_open_fail");
     return false;
   }
 
-  digitalWrite(TFT_CS, HIGH);
-  digitalWrite(SD_CS, LOW);
-  writeRunHeader(logFile);
-  digitalWrite(SD_CS, HIGH);
-  digitalWrite(TFT_CS, LOW);
+  // keep your existing variable for now (minimal disruption)
+  logFile = logCsvFile();
 
   loggingEnabled = true;
 
@@ -575,14 +566,8 @@ void stopLogging()
   }
 
   uint32_t stopMs = millis();
-  digitalWrite(TFT_CS, HIGH);
-  digitalWrite(SD_CS, LOW);
-  logFile.print("# stop_ms=");
-  logFile.println(stopMs);
-  logFile.flush();
-  logFile.close();
-  digitalWrite(SD_CS, HIGH);
-  digitalWrite(TFT_CS, LOW);
+  logCsvWriteCommentU32("stop_ms", stopMs, TFT_CS, SD_CS);
+  logCsvClose(TFT_CS, SD_CS);
 
   loggingEnabled = false;
   statusBar("LOG STOPPED", C_WARN);
@@ -2146,22 +2131,10 @@ void loop()
                        esc_us,
                        (long)rpmValue);
 
-      digitalWrite(TFT_CS, HIGH);
-      digitalWrite(SD_CS, LOW);
-      logFile.write((const uint8_t *)line, (size_t)n);
-      digitalWrite(SD_CS, HIGH);
-      digitalWrite(TFT_CS, LOW);
+      logCsvWriteBytes((const uint8_t*)line, (size_t)n, TFT_CS, SD_CS);
 
       static uint16_t flushCtr = 0;
-      if (++flushCtr >= (1000 / LOG_MS))
-      {
-        digitalWrite(TFT_CS, HIGH);
-        digitalWrite(SD_CS, LOW);
-        logFile.flush();
-        digitalWrite(SD_CS, HIGH);
-        digitalWrite(TFT_CS, LOW);
-        flushCtr = 0;
-      }
+      logCsvMaybeFlush(&flushCtr, (uint16_t)(1000 / LOG_MS), TFT_CS, SD_CS);
     }
   }
 
