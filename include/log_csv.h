@@ -2,28 +2,24 @@
 #include <Arduino.h>
 #include <SD.h>
 
-using LogHeaderWriter = void (*)(File&);
+// CSV logging helper for ESP32 rigs that share SPI between TFT and SD.
+// This module owns a single File handle internally.
+//
+// All functions that touch SD will:
+//  - pull TFT_CS HIGH
+//  - pull SD_CS LOW
+//  - do IO
+//  - pull SD_CS HIGH
+//  - pull TFT_CS LOW
 
-bool logCsvOpen(const char* filename,
-                int tftCsPin,
-                int sdCsPin,
-                LogHeaderWriter headerWriter);
+using LogCsvHeaderWriter = void (*)(fs::File&);
 
-void logCsvWriteBytes(const uint8_t* data, size_t n, int tftCsPin, int sdCsPin);
+bool      logCsvOpen(const char* path, int tftCsPin, int sdCsPin, LogCsvHeaderWriter headerWriter);
+void      logCsvClose(int tftCsPin, int sdCsPin);
+bool      logCsvIsOpen();
+fs::File  logCsvFile();               // returns a copy (File is a handle)
 
-void logCsvWriteCommentU32(const char* key,
-                           uint32_t value,
-                           int tftCsPin,
-                           int sdCsPin);
+void      logCsvWriteBytes(const uint8_t* data, size_t n, int tftCsPin, int sdCsPin);
+void      logCsvMaybeFlush(uint16_t* ctr, uint16_t flushEvery, int tftCsPin, int sdCsPin);
 
-void logCsvFlush(int tftCsPin, int sdCsPin);
-
-void logCsvMaybeFlush(uint16_t* flushCtr,
-                      uint16_t flushEveryN,
-                      int tftCsPin,
-                      int sdCsPin);
-
-void logCsvClose(int tftCsPin, int sdCsPin);
-
-bool logCsvIsOpen();
-File& logCsvFile();  // temporary bridge; ok to keep for now
+void      logCsvWriteCommentU32(const char* key, uint32_t value, int tftCsPin, int sdCsPin);

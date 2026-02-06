@@ -1,174 +1,161 @@
 #include "log_json.h"
 
-static File s_json;
+static fs::File s_json;
 
-static void spiSelectSd(int tftCsPin, int sdCsPin){
-  digitalWrite(tftCsPin, HIGH);
-  digitalWrite(sdCsPin, LOW);
+static inline void spiSel(int tft, int sd){
+  digitalWrite(tft, HIGH);
+  digitalWrite(sd, LOW);
+}
+static inline void spiDesel(int tft, int sd){
+  digitalWrite(sd, HIGH);
+  digitalWrite(tft, LOW);
 }
 
-static void spiDeselectSd(int tftCsPin, int sdCsPin){
-  digitalWrite(sdCsPin, HIGH);
-  digitalWrite(tftCsPin, HIGH);
-}
-
-static void jsonWriteEscaped(File& f, const char* s){
-  if(!s) { f.print(""); return; }
-  for(const char* p = s; *p; ++p){
-    const char c = *p;
-    switch(c){
-      case '\"': f.print("\\\""); break;
-      case '\\': f.print("\\\\"); break;
-      case '\b': f.print("\\b");  break;
-      case '\f': f.print("\\f");  break;
-      case '\n': f.print("\\n");  break;
-      case '\r': f.print("\\r");  break;
-      case '\t': f.print("\\t");  break;
-      default:
-        if((uint8_t)c < 0x20) f.print(' ');
-        else f.print(c);
-        break;
+static void writeEscaped(fs::File& f, const char* s){
+  f.print("\"");
+  if(s){
+    for(const char* p=s; *p; ++p){
+      char c=*p;
+      if(c=='\\' || c=='"'){
+        f.print('\\'); f.print(c);
+      }else if(c=='\n'){
+        f.print("\\n");
+      }else{
+        f.print(c);
+      }
     }
   }
+  f.print("\"");
 }
 
-bool logJsonOpen(const char* filename, int tftCsPin, int sdCsPin){
-  if(s_json) s_json.close();
+bool logJsonOpen(const char* path, int tft, int sd){
+  if(s_json) return true;
 
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json = SD.open(filename, FILE_WRITE);
-  spiDeselectSd(tftCsPin, sdCsPin);
+  spiSel(tft,sd);
+  s_json = SD.open(path, FILE_WRITE);
+  spiDesel(tft,sd);
 
   if(!s_json) return false;
 
-  spiSelectSd(tftCsPin, sdCsPin);
+  spiSel(tft,sd);
   s_json.println("{");
-  spiDeselectSd(tftCsPin, sdCsPin);
+  spiDesel(tft,sd);
 
   return true;
 }
 
-static void writeKeyPrefix(const char* key, int tftCsPin, int sdCsPin){
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print("  \"");
-  jsonWriteEscaped(s_json, key);
-  s_json.print("\": ");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteKeyValueStr(const char* key, const char* value, int tftCsPin, int sdCsPin){
-  if(!s_json || !key) return;
-  writeKeyPrefix(key, tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print("\"");
-  jsonWriteEscaped(s_json, value ? value : "");
-  s_json.println("\",");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteKeyValueU32(const char* key, uint32_t value, int tftCsPin, int sdCsPin){
-  if(!s_json || !key) return;
-  writeKeyPrefix(key, tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print(value);
-  s_json.println(",");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteKeyValueI32(const char* key, int32_t value, int tftCsPin, int sdCsPin){
-  if(!s_json || !key) return;
-  writeKeyPrefix(key, tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print(value);
-  s_json.println(",");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteKeyValueF(const char* key, float value, int decimals, int tftCsPin, int sdCsPin){
-  if(!s_json || !key) return;
-  if(decimals < 0) decimals = 0;
-  if(decimals > 9) decimals = 9;
-
-  writeKeyPrefix(key, tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print(value, decimals);
-  s_json.println(",");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteKeyValueBool(const char* key, bool value, int tftCsPin, int sdCsPin){
-  if(!s_json || !key) return;
-  writeKeyPrefix(key, tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print(value ? "true" : "false");
-  s_json.println(",");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonWriteColumns(const char* const* cols, size_t n, int tftCsPin, int sdCsPin){
-  if(!s_json || !cols) return;
-
-  writeKeyPrefix("columns", tftCsPin, sdCsPin);
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print("[");
-  for(size_t i=0;i<n;i++){
-    if(i) s_json.print(",");
-    s_json.print("\"");
-    jsonWriteEscaped(s_json, cols[i] ? cols[i] : "");
-    s_json.print("\"");
-  }
-  s_json.println("],");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonBeginObject(const char* keyOrNull, int tftCsPin, int sdCsPin){
+void logJsonClose(int tft, int sd){
   if(!s_json) return;
 
-  spiSelectSd(tftCsPin, sdCsPin);
-  if(keyOrNull){
-    s_json.print("  \"");
-    jsonWriteEscaped(s_json, keyOrNull);
-    s_json.println("\": {");
-  } else {
-    s_json.println("{");
-  }
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonEndObject(bool trailingComma, int tftCsPin, int sdCsPin){
-  if(!s_json) return;
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  if(trailingComma) s_json.println("  },");
-  else              s_json.println("  }");
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonCloseWithStopMs(uint32_t stopMs, int tftCsPin, int sdCsPin){
-  if(!s_json) return;
-
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print("  \"stop_ms\": ");
-  s_json.println(stopMs);
+  spiSel(tft,sd);
   s_json.println("}");
   s_json.flush();
   s_json.close();
-  spiDeselectSd(tftCsPin, sdCsPin);
-}
-
-void logJsonClose(int tftCsPin, int sdCsPin){
-  if(!s_json) return;
-  spiSelectSd(tftCsPin, sdCsPin);
-  s_json.flush();
-  s_json.close();
-  spiDeselectSd(tftCsPin, sdCsPin);
+  spiDesel(tft,sd);
 }
 
 bool logJsonIsOpen(){ return (bool)s_json; }
-File& logJsonFile(){ return s_json; }
+fs::File logJsonFile(){ return s_json; }
+
+void logJsonBeginObject(const char* name, int tft, int sd){
+  if(!s_json) return;
+
+  spiSel(tft,sd);
+  if(name){
+    writeEscaped(s_json,name);
+    s_json.print(": ");
+  }
+  s_json.println("{");
+  spiDesel(tft,sd);
+}
+
+void logJsonEndObject(bool comma, int tft, int sd){
+  if(!s_json) return;
+  spiSel(tft,sd);
+  s_json.print("}");
+  if(comma) s_json.print(",");
+  s_json.println();
+  spiDesel(tft,sd);
+}
+
+static void keyPrefix(const char* k, int tft, int sd){
+  spiSel(tft,sd);
+  writeEscaped(s_json,k);
+  s_json.print(": ");
+  spiDesel(tft,sd);
+}
+
+void logJsonWriteKeyValueStr(const char* k,const char* v,int tft,int sd){
+  if(!s_json) return;
+  keyPrefix(k,tft,sd);
+  spiSel(tft,sd);
+  writeEscaped(s_json,v?v:"");
+  s_json.println(",");
+  spiDesel(tft,sd);
+}
+
+void logJsonWriteKeyValueU32(const char* k,uint32_t v,int tft,int sd){
+  if(!s_json) return;
+  keyPrefix(k,tft,sd);
+  spiSel(tft,sd);
+  s_json.print(v);
+  s_json.println(",");
+  spiDesel(tft,sd);
+}
+
+void logJsonWriteKeyValueI32(const char* k,int32_t v,int tft,int sd){
+  if(!s_json) return;
+  keyPrefix(k,tft,sd);
+  spiSel(tft,sd);
+  s_json.print(v);
+  s_json.println(",");
+  spiDesel(tft,sd);
+}
+
+void logJsonWriteKeyValueF(const char* k,float v,int d,int tft,int sd){
+  if(!s_json) return;
+  keyPrefix(k,tft,sd);
+  spiSel(tft,sd);
+  s_json.print(v,d);
+  s_json.println(",");
+  spiDesel(tft,sd);
+}
+
+void logJsonWriteKeyValueBool(const char* k,bool v,int tft,int sd){
+  if(!s_json) return;
+  keyPrefix(k,tft,sd);
+  spiSel(tft,sd);
+  s_json.print(v?"true":"false");
+  s_json.println(",");
+  spiDesel(tft,sd);
+}
+
+// ✅ COLUMN ARRAY WRITER
+void logJsonWriteColumns(const char* const* cols,size_t count,int tft,int sd){
+  if(!s_json || !cols || count==0) return;
+
+  spiSel(tft,sd);
+
+  writeEscaped(s_json,"columns");
+  s_json.print(": [");
+
+  for(size_t i=0;i<count;i++){
+    writeEscaped(s_json, cols[i]);
+    if(i+1<count) s_json.print(", ");
+  }
+
+  s_json.println("],");
+  spiDesel(tft,sd);
+}
+
+void logJsonCloseWithStopMs(uint32_t stopMs,int tft,int sd){
+  if(!s_json) return;
+
+  spiSel(tft,sd);
+  writeEscaped(s_json,"stop_ms");
+  s_json.print(": ");
+  s_json.println(stopMs);
+  spiDesel(tft,sd);
+
+  logJsonClose(tft,sd);
+}
