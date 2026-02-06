@@ -5,53 +5,27 @@
   ESP32 MOTOR TEST RIG – IMU + SD LOGGING + NO-FLICKER UI + ESC MOTOR CONTROL
   FULL SWAP + STRICT CLI (GNU-ish) + ESC CALIBRATE + PWM FREQ CONTROL
 
-  FIXES INCLUDED (latest):
-    - STRICT CLI: NO side-effects on parse/validation errors.
-    - SWEEP STOP FIX: when a sweep completes or user runs `sweep stop`,
-        * it now forces thrTarget=0.0 (ramps down via rampRate)
-        * so ESC output actually returns to MIN and motor stops
-    - Ramp/Tri/Step completion paths call sweepStop() only (no leaving thrTarget at ramp_stop)
-    - Default ESC PWM frequency = 200 Hz
-    - ESC calibration state machine: esc calibrate / esc calibrate stop
+  Upgrades included:
+    - JSON sidecar per run: RUN####.JSON (nested structure v2 + summary + device diagnostics)
+    - Live computed summary stats (min/max/mean) written at log stop
+    - Peak timestamps for vib_inst and rpm
+    - RUN_SUMMARY.CSV (one row per run; Excel-friendly)
+    - Test metadata captured (manual_set/manual_timed/sweep_* params)
 
   SAFETY NOTE:
     - `sweep stop` ramps throttle down to 0 (soft stop).
     - `motor estop` is immediate output low + disarm (hard stop).
     - Props OFF during development/testing.
-
-  COMMANDS:
-    help [motor|sweep|log|esc]
-    status [motor|esc]
-
-    log start
-    log stop
-
-    base capture [--windows N]
-
-    set motor "text..."
-    set notes "text..."
-
-    motor arm
-    motor disarm
-    motor estop
-    motor set --thr f           (0..1)
-    motor set --us  n           (1000..2000)
-    motor manual --thr f --sec s [--no-log]
-
-    sweep stop
-    sweep step --start a --stop b --step c --hold s [--ramp r]
-    sweep ramp --start a --stop b --dur s
-    sweep tri  --min a --max b --period s --cycles n
-
-    esc set --freq Hz           (50..500)
-    esc calibrate
-    esc calibrate stop
 */
 
 #include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
+
 #include "log_csv.h"
+#include "log_json.h"
+#include "run_summary.h"
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <math.h>
@@ -77,7 +51,7 @@ static constexpr int ESC_MIN_US = 1000;
 static constexpr int ESC_MAX_US = 2000;
 
 // Default ESC frequency
-static constexpr uint32_t ESC_FREQ_HZ_DEFAULT = 200;
+static constexpr uint32_t ESC_FREQ_HZ_DEFAULT = 400;
 static constexpr uint8_t ESC_LEDC_RES_BITS = 16;
 static constexpr uint8_t ESC_LEDC_CH = 0;
 
@@ -111,8 +85,9 @@ static constexpr float VIB_EPS = 0.01f;
 static constexpr float THR_EPS = 0.01f;
 
 // ----------------- STATE -----------------
-File logFile;
+File logFile; // legacy bridge
 bool loggingEnabled = false;
+bool jsonEnabled = false;
 bool sdOk = false;
 uint32_t runNumber = 0;
 
@@ -254,9 +229,11 @@ bool readRegs(uint8_t r, uint8_t *b, size_t n)
   Wire.write(r);
   if (Wire.endTransmission(false) != 0)
     return false;
+
   const uint8_t req = (uint8_t)n;
   if (Wire.requestFrom((uint8_t)IMU_ADDR, req) != req)
     return false;
+
   for (size_t i = 0; i < n; i++)
     b[i] = Wire.read();
   return true;
@@ -345,20 +322,13 @@ const char *motorModeName(MotorMode m)
 {
   switch (m)
   {
-  case MOTOR_OFF:
-    return "OFF";
-  case MOTOR_MANUAL:
-    return "MANUAL";
-  case MOTOR_SWEEP_STEP:
-    return "STEP";
-  case MOTOR_SWEEP_RAMP:
-    return "RAMP";
-  case MOTOR_SWEEP_TRI:
-    return "TRI";
-  case MOTOR_SETUP_MANUAL_TIMER:
-    return "SETUP";
-  default:
-    return "UNK";
+  case MOTOR_OFF: return "OFF";
+  case MOTOR_MANUAL: return "MANUAL";
+  case MOTOR_SWEEP_STEP: return "STEP";
+  case MOTOR_SWEEP_RAMP: return "RAMP";
+  case MOTOR_SWEEP_TRI: return "TRI";
+  case MOTOR_SETUP_MANUAL_TIMER: return "SETUP";
+  default: return "UNK";
   }
 }
 
@@ -366,29 +336,22 @@ const char *escCalName(EscCalState s)
 {
   switch (s)
   {
-  case ESC_CAL_OFF:
-    return "OFF";
-  case ESC_CAL_HIGH:
-    return "HIGH";
-  case ESC_CAL_LOW:
-    return "LOW";
-  case ESC_CAL_DONE:
-    return "DONE";
-  default:
-    return "UNK";
+  case ESC_CAL_OFF: return "OFF";
+  case ESC_CAL_HIGH: return "HIGH";
+  case ESC_CAL_LOW: return "LOW";
+  case ESC_CAL_DONE: return "DONE";
+  default: return "UNK";
   }
 }
 
-// ----------------- ESC PWM (ESP32 core 3.x) -----------------
+// ----------------- ESC PWM -----------------
 uint32_t usToDuty(uint32_t us)
 {
   const uint32_t period_us = 1000000UL / (uint32_t)escFreqHz;
   const uint32_t maxDuty = (1UL << ESC_LEDC_RES_BITS) - 1UL;
-  if (us >= period_us)
-    us = period_us - 1;
+  if (us >= period_us) us = period_us - 1;
   uint64_t duty = (uint64_t)us * (uint64_t)maxDuty / (uint64_t)period_us;
-  if (duty > maxDuty)
-    duty = maxDuty;
+  if (duty > maxDuty) duty = maxDuty;
   return (uint32_t)duty;
 }
 
@@ -402,23 +365,14 @@ void escWriteUs(int us)
 {
   us = clampInt(us, ESC_MIN_US, ESC_MAX_US);
   const uint32_t duty = usToDuty((uint32_t)us);
-  ledcWrite(ESC_LEDC_CH, duty); // legacy: (channel, duty)
+  ledcWrite(ESC_LEDC_CH, duty); // legacy API: (channel, duty)
 }
 
 int currentEscUs()
 {
-  if (escCalState == ESC_CAL_HIGH)
-  {
-    return ESC_MAX_US;
-  }
-  if (escCalState == ESC_CAL_LOW)
-  {
-    return ESC_MIN_US;
-  }
-  if (!motorArmed)
-  {
-    return ESC_MIN_US;
-  }
+  if (escCalState == ESC_CAL_HIGH) return ESC_MAX_US;
+  if (escCalState == ESC_CAL_LOW)  return ESC_MIN_US;
+  if (!motorArmed) return ESC_MIN_US;
   return thrToUs(thrCmd);
 }
 
@@ -454,8 +408,8 @@ uint32_t findNextRunNumber()
 {
   uint32_t maxRun = 0;
   File root = SD.open("/");
-  if (!root)
-    return 1;
+  if (!root) return 1;
+
   File f = root.openNextFile();
   while (f)
   {
@@ -463,15 +417,13 @@ uint32_t findNextRunNumber()
     if (!f.isDirectory())
     {
       const char *p = name;
-      if (p[0] == '/')
-        p++;
+      if (p[0] == '/') p++;
       if (strlen(p) == 11 && strncmp(p, "RUN", 3) == 0 && strncmp(p + 7, ".CSV", 4) == 0)
       {
         char numStr[5] = {0};
         memcpy(numStr, p + 3, 4);
         uint32_t n = (uint32_t)atoi(numStr);
-        if (n > maxRun)
-          maxRun = n;
+        if (n > maxRun) maxRun = n;
       }
     }
     f = root.openNextFile();
@@ -479,38 +431,106 @@ uint32_t findNextRunNumber()
   return maxRun + 1;
 }
 
+// ----------------- CSV HEADER -----------------
 void writeRunHeader(File &f)
 {
   f.println("# rig=esp32_motor_dyno");
   f.println("# fw=1.4_sweep_stop_fix");
-  f.print("# motor_id=");
-  f.println(motorId);
-  f.print("# notes=");
-  f.println(notes);
-  f.print("# imu_whoami=0x");
-  f.println(whoami, HEX);
-  f.print("# esc_pin=");
-  f.println(ESC_PIN);
-  f.print("# esc_freq_hz=");
-  f.println(escFreqHz);
-  f.print("# esc_min_us=");
-  f.println(ESC_MIN_US);
-  f.print("# esc_max_us=");
-  f.println(ESC_MAX_US);
+  f.print("# motor_id="); f.println(motorId);
+  f.print("# notes="); f.println(notes);
+  f.print("# imu_whoami=0x"); f.println(whoami, HEX);
+  f.print("# esc_pin="); f.println(ESC_PIN);
+  f.print("# esc_freq_hz="); f.println(escFreqHz);
+  f.print("# esc_min_us="); f.println(ESC_MIN_US);
+  f.print("# esc_max_us="); f.println(ESC_MAX_US);
   f.println("# sample_hz=250");
   f.println("# log_hz=50");
-  f.print("# vib_window_n=");
-  f.println(RMS_N);
-  f.print("# start_ms=");
-  f.println(runStartMs);
-  f.print("# baseline_valid=");
-  f.println(baselineValidAtRun ? "true" : "false");
-  f.print("# baseline_vibrms=");
-  f.println(baselineAtRun, 6);
+  f.print("# vib_window_n="); f.println(RMS_N);
+  f.print("# start_ms="); f.println(runStartMs);
+  f.print("# baseline_valid="); f.println(baselineValidAtRun ? "true" : "false");
+  f.print("# baseline_vibrms="); f.println(baselineAtRun, 6);
   f.println("timestamp_ms,ax_mps2,ay_mps2,az_mps2,mag_mps2,vib_inst_mps2,vib_rms_mps2,vib_net_mps2,thr_cmd,esc_us,rpm");
   f.flush();
 }
 
+// ----------------- LOG SUMMARY (live computed) -----------------
+struct StatF {
+  bool has=false;
+  float minv=0, maxv=0;
+  double sum=0.0;
+  uint32_t n=0;
+};
+struct StatI {
+  bool has=false;
+  int32_t minv=0, maxv=0;
+  int64_t sum=0;
+  uint32_t n=0;
+};
+
+static inline void statFReset(StatF& s){ s.has=false; s.minv=0; s.maxv=0; s.sum=0; s.n=0; }
+static inline void statIReset(StatI& s){ s.has=false; s.minv=0; s.maxv=0; s.sum=0; s.n=0; }
+
+static inline void statFUpdate(StatF& s, float v){
+  if(!s.has){ s.has=true; s.minv=v; s.maxv=v; s.sum=v; s.n=1; return; }
+  if(v < s.minv) s.minv=v;
+  if(v > s.maxv) s.maxv=v;
+  s.sum += (double)v;
+  s.n++;
+}
+static inline void statIUpdate(StatI& s, int32_t v){
+  if(!s.has){ s.has=true; s.minv=v; s.maxv=v; s.sum=v; s.n=1; return; }
+  if(v < s.minv) s.minv=v;
+  if(v > s.maxv) s.maxv=v;
+  s.sum += (int64_t)v;
+  s.n++;
+}
+static inline float statFMean(const StatF& s){ return s.n ? (float)(s.sum/(double)s.n) : 0.0f; }
+static inline float statIMean(const StatI& s){ return s.n ? (float)((double)s.sum/(double)s.n) : 0.0f; }
+
+StatF st_vib_inst, st_vib_rms, st_vib_net, st_thr_cmd, st_esc_us;
+StatI st_rpm;
+uint32_t logSamplesTotal=0;
+uint32_t logSamplesRpmValid=0;
+
+// ----------------- TEST METADATA -----------------
+enum TestKind : uint8_t {
+  TEST_NONE=0,
+  TEST_LOG_ONLY,
+  TEST_MANUAL_SET,
+  TEST_MANUAL_TIMED,
+  TEST_SWEEP_STEP,
+  TEST_SWEEP_RAMP,
+  TEST_SWEEP_TRI
+};
+
+TestKind testKind = TEST_NONE;
+char testName[20] = "none";
+float test_a=0, test_b=0, test_c=0, test_d=0;
+int test_i=0;
+
+static inline void setTest(TestKind k, const char* name){
+  testKind = k;
+  strncpy(testName, name ? name : "none", sizeof(testName)-1);
+  testName[sizeof(testName)-1]='\0';
+  test_a=test_b=test_c=test_d=0.0f;
+  test_i=0;
+}
+
+// ----------------- PEAK TIMESTAMPS -----------------
+uint32_t vibInstPeakMs=0;
+float vibInstPeakVal=0.0f;
+uint32_t rpmPeakMs=0;
+int32_t rpmPeakVal=-1;
+
+// ----------------- DEVICE DIAGNOSTICS -----------------
+uint32_t heapFreeStart=0;
+uint32_t heapFreeStop=0;
+uint32_t heapMinSeen=0;
+uint32_t cpuFreqMHz=0;
+uint32_t sketchSizeB=0;
+uint32_t freeSketchB=0;
+
+// ----------------- LOGGING START/STOP -----------------
 bool startLogging()
 {
   if (!sdOk)
@@ -534,17 +554,109 @@ bool startLogging()
   baselineAtRun = vibBaseline;
   baselineValidAtRun = baselineValid;
 
-  char fname[16];
-  snprintf(fname, sizeof(fname), "/RUN%04lu.CSV", (unsigned long)runNumber);
+  // reset summary
+  statFReset(st_vib_inst);
+  statFReset(st_vib_rms);
+  statFReset(st_vib_net);
+  statFReset(st_thr_cmd);
+  statFReset(st_esc_us);
+  statIReset(st_rpm);
+  logSamplesTotal = 0;
+  logSamplesRpmValid = 0;
 
-  if(!logCsvOpen(fname, TFT_CS, SD_CS, writeRunHeader)){
+  // diagnostics snapshot
+  heapFreeStart = ESP.getFreeHeap();
+  heapMinSeen   = ESP.getMinFreeHeap();
+  cpuFreqMHz    = (uint32_t)getCpuFrequencyMhz();
+  sketchSizeB   = ESP.getSketchSize();
+  freeSketchB   = ESP.getFreeSketchSpace();
+
+  vibInstPeakMs = 0;
+  vibInstPeakVal = 0.0f;
+  rpmPeakMs = 0;
+  rpmPeakVal = -1;
+
+  char csvName[20];
+  char jsonName[20];
+  snprintf(csvName, sizeof(csvName), "/RUN%04lu.CSV", (unsigned long)runNumber);
+  snprintf(jsonName, sizeof(jsonName), "/RUN%04lu.JSON", (unsigned long)runNumber);
+
+  // CSV open first (must-have)
+  if (!logCsvOpen(csvName, TFT_CS, SD_CS, writeRunHeader))
+  {
     statusBar("LOG OPEN FAIL", C_BAD);
     Serial.println("ERR log_open_fail");
     return false;
   }
+  logFile = logCsvFile(); // bridge
 
-  // keep your existing variable for now (minimal disruption)
-  logFile = logCsvFile();
+  // JSON open second (nice-to-have)
+  jsonEnabled = false;
+  if (logJsonOpen(jsonName, TFT_CS, SD_CS))
+  {
+    jsonEnabled = true;
+
+    logJsonWriteKeyValueStr("schema", "esp32_motor_rig_run_v2", TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("rig", "esp32_motor_dyno", TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("fw", "1.4_sweep_stop_fix", TFT_CS, SD_CS);
+
+    logJsonBeginObject("files", TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("csv", csvName, TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("json", jsonName, TFT_CS, SD_CS);
+    logJsonEndObject(true, TFT_CS, SD_CS);
+
+    logJsonBeginObject("device", TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("cpu_freq_mhz", cpuFreqMHz, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("heap_free_start", heapFreeStart, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("heap_min_start", heapMinSeen, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("sketch_size_bytes", sketchSizeB, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("free_sketch_bytes", freeSketchB, TFT_CS, SD_CS);
+    logJsonEndObject(true, TFT_CS, SD_CS);
+
+    logJsonBeginObject("run", TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("start_ms", runStartMs, TFT_CS, SD_CS);
+    logJsonWriteKeyValueBool("baseline_valid", baselineValidAtRun, TFT_CS, SD_CS);
+    logJsonWriteKeyValueF("baseline_vibrms", baselineAtRun, 6, TFT_CS, SD_CS);
+    char whoBuf[16];
+    snprintf(whoBuf, sizeof(whoBuf), "0x%02X", (unsigned)whoami);
+    logJsonWriteKeyValueStr("imu_whoami", whoBuf, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("esc_pin", (int32_t)ESC_PIN, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("esc_freq_hz", (uint32_t)escFreqHz, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("esc_min_us", (int32_t)ESC_MIN_US, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("esc_max_us", (int32_t)ESC_MAX_US, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("sample_hz", 250, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("log_hz", 50, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("vib_window_n", (int32_t)RMS_N, TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("motor_id", motorId, TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("notes", notes, TFT_CS, SD_CS);
+    logJsonEndObject(true, TFT_CS, SD_CS);
+
+    logJsonBeginObject("test", TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("name", testName, TFT_CS, SD_CS);
+    logJsonWriteKeyValueF("a", test_a, 6, TFT_CS, SD_CS);
+    logJsonWriteKeyValueF("b", test_b, 6, TFT_CS, SD_CS);
+    logJsonWriteKeyValueF("c", test_c, 6, TFT_CS, SD_CS);
+    logJsonWriteKeyValueF("d", test_d, 6, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("i", test_i, TFT_CS, SD_CS);
+    logJsonEndObject(true, TFT_CS, SD_CS);
+
+    static const char* cols[] = {
+      "timestamp_ms",
+      "ax_mps2","ay_mps2","az_mps2",
+      "mag_mps2",
+      "vib_inst_mps2",
+      "vib_rms_mps2",
+      "vib_net_mps2",
+      "thr_cmd",
+      "esc_us",
+      "rpm"
+    };
+    logJsonWriteColumns(cols, sizeof(cols)/sizeof(cols[0]), TFT_CS, SD_CS);
+  }
+  else
+  {
+    Serial.println("WARN json_open_fail (continuing csv only)");
+  }
 
   loggingEnabled = true;
 
@@ -552,9 +664,46 @@ bool startLogging()
   snprintf(msg, sizeof(msg), "LOGGING RUN %04lu", (unsigned long)runNumber);
   statusBar(msg, C_OK);
 
-  Serial.print("OK log_started file=");
-  Serial.println(fname);
+  Serial.print("OK log_started csv=");
+  Serial.print(csvName);
+  Serial.print(" json=");
+  Serial.println(jsonEnabled ? jsonName : "none");
+
   return true;
+}
+
+static void appendRunSummaryCsv(uint32_t stopMs)
+{
+  // One-row per run for easy Excel use
+  // File: /RUN_SUMMARY.CSV
+  // Columns: run,start_ms,stop_ms,duration_ms,test,thr_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max
+  const char* summaryFile = "/RUN_SUMMARY.CSV";
+  const char* header =
+    "run,start_ms,stop_ms,duration_ms,test,thr_cmd_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max";
+
+  const uint32_t durationMs = stopMs - runStartMs;
+
+  float thrMax = st_thr_cmd.has ? st_thr_cmd.maxv : 0.0f;
+  float escMax = st_esc_us.has ? st_esc_us.maxv : 0.0f;
+  float vibInstMax = st_vib_inst.has ? st_vib_inst.maxv : 0.0f;
+  float vibRmsMean = st_vib_rms.has ? statFMean(st_vib_rms) : 0.0f;
+  int32_t rpmMax = st_rpm.has ? st_rpm.maxv : -1;
+
+  char row[220];
+  snprintf(row, sizeof(row),
+           "%lu,%lu,%lu,%lu,%s,%.6f,%.0f,%.6f,%.6f,%ld",
+           (unsigned long)runNumber,
+           (unsigned long)runStartMs,
+           (unsigned long)stopMs,
+           (unsigned long)durationMs,
+           testName,
+           thrMax,
+           escMax,
+           vibInstMax,
+           vibRmsMean,
+           (long)rpmMax);
+
+  (void)runSummaryAppendRow(summaryFile, TFT_CS, SD_CS, row, true, header);
 }
 
 void stopLogging()
@@ -566,10 +715,75 @@ void stopLogging()
   }
 
   uint32_t stopMs = millis();
+
+  // CSV footer + close
   logCsvWriteCommentU32("stop_ms", stopMs, TFT_CS, SD_CS);
   logCsvClose(TFT_CS, SD_CS);
 
+  // Append global summary row (Excel-friendly)
+  appendRunSummaryCsv(stopMs);
+
+  // JSON summary + stop_ms + close
+  if (jsonEnabled && logJsonIsOpen())
+  {
+    heapFreeStop = ESP.getFreeHeap();
+
+    const uint32_t durationMs = stopMs - runStartMs;
+
+    logJsonBeginObject("summary", TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("duration_ms", durationMs, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("samples_total", logSamplesTotal, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("samples_rpm_valid", logSamplesRpmValid, TFT_CS, SD_CS);
+
+    logJsonWriteKeyValueU32("heap_free_stop", heapFreeStop, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("heap_min", heapMinSeen, TFT_CS, SD_CS);
+
+    logJsonWriteKeyValueF("vib_inst_peak", vibInstPeakVal, 6, TFT_CS, SD_CS);
+    logJsonWriteKeyValueU32("vib_inst_peak_ms", vibInstPeakMs, TFT_CS, SD_CS);
+
+    if (rpmPeakVal >= 0) {
+      logJsonWriteKeyValueI32("rpm_peak", rpmPeakVal, TFT_CS, SD_CS);
+      logJsonWriteKeyValueU32("rpm_peak_ms", rpmPeakMs, TFT_CS, SD_CS);
+    }
+
+    if (st_vib_inst.has) {
+      logJsonWriteKeyValueF("vib_inst_min", st_vib_inst.minv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_inst_max", st_vib_inst.maxv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_inst_mean", statFMean(st_vib_inst), 6, TFT_CS, SD_CS);
+    }
+    if (st_vib_rms.has) {
+      logJsonWriteKeyValueF("vib_rms_min", st_vib_rms.minv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_rms_max", st_vib_rms.maxv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_rms_mean", statFMean(st_vib_rms), 6, TFT_CS, SD_CS);
+    }
+    if (st_vib_net.has) {
+      logJsonWriteKeyValueF("vib_net_min", st_vib_net.minv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_net_max", st_vib_net.maxv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vib_net_mean", statFMean(st_vib_net), 6, TFT_CS, SD_CS);
+    }
+    if (st_thr_cmd.has) {
+      logJsonWriteKeyValueF("thr_cmd_min", st_thr_cmd.minv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("thr_cmd_max", st_thr_cmd.maxv, 6, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("thr_cmd_mean", statFMean(st_thr_cmd), 6, TFT_CS, SD_CS);
+    }
+    if (st_esc_us.has) {
+      logJsonWriteKeyValueF("esc_us_min", st_esc_us.minv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("esc_us_max", st_esc_us.maxv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("esc_us_mean", statFMean(st_esc_us), 3, TFT_CS, SD_CS);
+    }
+    if (st_rpm.has) {
+      logJsonWriteKeyValueI32("rpm_min", st_rpm.minv, TFT_CS, SD_CS);
+      logJsonWriteKeyValueI32("rpm_max", st_rpm.maxv, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("rpm_mean", statIMean(st_rpm), 2, TFT_CS, SD_CS);
+    }
+
+    logJsonEndObject(true, TFT_CS, SD_CS);
+    logJsonCloseWithStopMs(stopMs, TFT_CS, SD_CS);
+  }
+
+  jsonEnabled = false;
   loggingEnabled = false;
+
   statusBar("LOG STOPPED", C_WARN);
   Serial.println("OK log_stopped");
 
@@ -579,10 +793,8 @@ void stopLogging()
 // ----------------- BASELINE -----------------
 void startBaselineCapture(int windows)
 {
-  if (windows < 1)
-    windows = 1;
-  if (windows > 30)
-    windows = 30;
+  if (windows < 1) windows = 1;
+  if (windows > 30) windows = 30;
   baselineTargetWindows = windows;
 
   baselineCaptureActive = true;
@@ -645,6 +857,8 @@ void motorDisarm(const char *reason)
   statusBar(reason ? reason : "MOTOR DISARM", C_BAD);
   Serial.print("OK motor_disarm reason=");
   Serial.println(reason ? reason : "(none)");
+
+  setTest(TEST_NONE, "none");
 }
 
 void motorArm()
@@ -656,20 +870,19 @@ void motorArm()
   manualTimerActive = false;
   escWriteUs(ESC_MIN_US);
 
+  setTest(TEST_NONE, "none");
+
   statusBar("MOTOR ARMED", C_OK);
   Serial.println("OK motor_arm");
 }
 
-// FIXED: sweepStop now forces throttle target to 0 so ESC ramps down and stops.
 void sweepStop()
 {
   motorMode = MOTOR_MANUAL;
   step_holding = false;
   manualTimerActive = false;
 
-  thrTarget = 0.0f; // <-- critical stop behavior
-  // thrCmd slews down to 0 via rampRate in motorUpdateTick()
-
+  thrTarget = 0.0f;
   Serial.println("OK sweep_stop");
   statusBar("SWEEP STOP", C_WARN);
 }
@@ -696,6 +909,12 @@ void sweepStartStep(float start, float stop, float step, float hold_s, float ram
   step_phaseStartMs = millis();
   motorMode = MOTOR_SWEEP_STEP;
 
+  setTest(TEST_SWEEP_STEP, "sweep_step");
+  test_a = step_start;
+  test_b = step_stop;
+  test_c = step_step;
+  test_d = step_hold_s;
+
   Serial.println("OK sweep_step_start");
   statusBar("SWEEP STEP", C_OK);
 }
@@ -715,6 +934,11 @@ void sweepStartRamp(float start, float stop, float dur_s)
   ramp_dur_s = (dur_s > 0.1f) ? dur_s : 1.0f;
   ramp_startMs = millis();
   motorMode = MOTOR_SWEEP_RAMP;
+
+  setTest(TEST_SWEEP_RAMP, "sweep_ramp");
+  test_a = ramp_start;
+  test_b = ramp_stop;
+  test_c = ramp_dur_s;
 
   Serial.println("OK sweep_ramp_start");
   statusBar("SWEEP RAMP", C_OK);
@@ -742,6 +966,12 @@ void sweepStartTri(float tmin, float tmax, float period_s, int cycles)
   tri_cycles = (cycles > 0) ? cycles : 1;
   tri_startMs = millis();
   motorMode = MOTOR_SWEEP_TRI;
+
+  setTest(TEST_SWEEP_TRI, "sweep_tri");
+  test_a = tri_min;
+  test_b = tri_max;
+  test_c = tri_period_s;
+  test_i = tri_cycles;
 
   Serial.println("OK sweep_tri_start");
   statusBar("SWEEP TRI", C_OK);
@@ -771,6 +1001,11 @@ void startManualTimed(float thr, float sec, bool noLog)
   motorMode = MOTOR_SETUP_MANUAL_TIMER;
   manualTimerActive = true;
   manualStopMs = millis() + (uint32_t)(sec * 1000.0f);
+
+  setTest(TEST_MANUAL_TIMED, "manual_timed");
+  test_a = thrTarget;
+  test_b = sec;
+  test_i = noLog ? 1 : 0;
 
   Serial.print("OK motor_manual thr=");
   Serial.print(thrTarget, 3);
@@ -811,8 +1046,7 @@ void escCalStop()
 
 void escCalTick(uint32_t nowMs)
 {
-  if (escCalState == ESC_CAL_OFF)
-    return;
+  if (escCalState == ESC_CAL_OFF) return;
 
   uint32_t dt = nowMs - escCalT0;
 
@@ -851,7 +1085,6 @@ void escCalTick(uint32_t nowMs)
 
 void motorUpdateTick(uint32_t nowMs)
 {
-  // Calibration overrides motor control
   if (escCalState != ESC_CAL_OFF)
   {
     escCalTick(nowMs);
@@ -867,7 +1100,6 @@ void motorUpdateTick(uint32_t nowMs)
   if (manualTimerActive && (int32_t)(nowMs - manualStopMs) >= 0)
   {
     manualTimerActive = false;
-    // when manual ends, fall back to manual mode and ramp to zero
     motorMode = MOTOR_MANUAL;
     thrTarget = 0.0f;
     Serial.println("OK manual_done");
@@ -894,10 +1126,7 @@ void motorUpdateTick(uint32_t nowMs)
       if (held_s >= step_hold_s)
       {
         float next = step_current + step_step;
-        if (next > step_stop + 1e-6f)
-        {
-          sweepStop(); // will force thrTarget=0
-        }
+        if (next > step_stop + 1e-6f) sweepStop();
         else
         {
           step_current = next;
@@ -914,14 +1143,8 @@ void motorUpdateTick(uint32_t nowMs)
   {
     float t = (float)(nowMs - ramp_startMs) / 1000.0f;
     float u = t / ramp_dur_s;
-    if (u >= 1.0f)
-    {
-      sweepStop(); // will force thrTarget=0
-    }
-    else
-    {
-      thrTarget = ramp_start + (ramp_stop - ramp_start) * u;
-    }
+    if (u >= 1.0f) sweepStop();
+    else thrTarget = ramp_start + (ramp_stop - ramp_start) * u;
   }
   break;
 
@@ -929,10 +1152,7 @@ void motorUpdateTick(uint32_t nowMs)
   {
     float elapsed_s = (float)(nowMs - tri_startMs) / 1000.0f;
     float total_s = tri_period_s * (float)tri_cycles;
-    if (elapsed_s >= total_s)
-    {
-      sweepStop(); // will force thrTarget=0
-    }
+    if (elapsed_s >= total_s) sweepStop();
     else
     {
       float phase = fmodf(elapsed_s, tri_period_s) / tri_period_s;
@@ -946,14 +1166,11 @@ void motorUpdateTick(uint32_t nowMs)
     break;
   }
 
-  // slew limit thrCmd toward thrTarget
   float dt = (float)MOTOR_MS / 1000.0f;
   float maxDelta = rampRate * dt;
   float diff = thrTarget - thrCmd;
-  if (diff > maxDelta)
-    diff = maxDelta;
-  else if (diff < -maxDelta)
-    diff = -maxDelta;
+  if (diff > maxDelta) diff = maxDelta;
+  else if (diff < -maxDelta) diff = -maxDelta;
 
   thrCmd = clamp01(thrCmd + diff);
   escWriteUs(thrToUs(thrCmd));
@@ -978,14 +1195,12 @@ void drawStaticUI()
   tft.print("WHO:0x");
   tft.print(whoami, HEX);
 
-  // left labels
   drawLabel2(COL1_X, BODY_Y0 + 0 * ROW_H, "AX:");
   drawLabel2(COL1_X, BODY_Y0 + 1 * ROW_H, "AY:");
   drawLabel2(COL1_X, BODY_Y0 + 2 * ROW_H, "AZ:");
   drawLabel2(COL1_X, BODY_Y0 + 3 * ROW_H, "VIB I:");
   drawLabel2(COL1_X, BODY_Y0 + 4 * ROW_H, "VIB R:");
 
-  // right labels
   drawLabel2(COL2_X, BODY_Y0 + 0 * ROW_H, "SD:");
   drawLabel2(COL2_X, BODY_Y0 + 1 * ROW_H, "RUN:");
   drawLabel2(COL2_X, BODY_Y0 + 2 * ROW_H, "MODE:");
@@ -1005,8 +1220,7 @@ size_t cliLen = 0;
 
 static inline char upc(char c)
 {
-  if (c >= 'a' && c <= 'z')
-    return (char)(c - 32);
+  if (c >= 'a' && c <= 'z') return (char)(c - 32);
   return c;
 }
 
@@ -1014,10 +1228,8 @@ bool streqi(const char *a, const char *b)
 {
   while (*a && *b)
   {
-    if (upc(*a) != upc(*b))
-      return false;
-    a++;
-    b++;
+    if (upc(*a) != upc(*b)) return false;
+    a++; b++;
   }
   return *a == '\0' && *b == '\0';
 }
@@ -1029,29 +1241,23 @@ int tokenize(char *s, char *argv[], int argvMax)
   int argc = 0;
   while (*s)
   {
-    while (*s == ' ' || *s == '\t')
-      s++;
-    if (!*s)
-      break;
-    if (argc >= argvMax)
-      return -1;
+    while (*s == ' ' || *s == '\t') s++;
+    if (!*s) break;
+    if (argc >= argvMax) return -1;
 
     if (*s == '"')
     {
       s++;
       argv[argc++] = s;
-      while (*s && *s != '"')
-        s++;
-      if (*s != '"')
-        return -2;
+      while (*s && *s != '"') s++;
+      if (*s != '"') return -2;
       *s = '\0';
       s++;
     }
     else
     {
       argv[argc++] = s;
-      while (*s && *s != ' ' && *s != '\t')
-        s++;
+      while (*s && *s != ' ' && *s != '\t') s++;
       if (*s)
       {
         *s = '\0';
@@ -1069,30 +1275,12 @@ const char *optValue(int argc, char *argv[], const char *shortFlag, const char *
   {
     if (shortFlag && streqi(argv[i], shortFlag))
     {
-      if (i + 1 >= argc)
-      {
-        ok = false;
-        return nullptr;
-      }
-      if (isFlag(argv[i + 1]))
-      {
-        ok = false;
-        return nullptr;
-      }
+      if (i + 1 >= argc || isFlag(argv[i + 1])) { ok = false; return nullptr; }
       return argv[i + 1];
     }
     if (longFlag && streqi(argv[i], longFlag))
     {
-      if (i + 1 >= argc)
-      {
-        ok = false;
-        return nullptr;
-      }
-      if (isFlag(argv[i + 1]))
-      {
-        ok = false;
-        return nullptr;
-      }
+      if (i + 1 >= argc || isFlag(argv[i + 1])) { ok = false; return nullptr; }
       return argv[i + 1];
     }
   }
@@ -1103,10 +1291,8 @@ bool hasFlag(int argc, char *argv[], const char *shortFlag, const char *longFlag
 {
   for (int i = 0; i < argc; i++)
   {
-    if (shortFlag && streqi(argv[i], shortFlag))
-      return true;
-    if (longFlag && streqi(argv[i], longFlag))
-      return true;
+    if (shortFlag && streqi(argv[i], shortFlag)) return true;
+    if (longFlag && streqi(argv[i], longFlag)) return true;
   }
   return false;
 }
@@ -1115,16 +1301,11 @@ bool checkNoUnknownFlags(int argc, char *argv[], const char *allowed[], int allo
 {
   for (int i = 0; i < argc; i++)
   {
-    if (!isFlag(argv[i]))
-      continue;
+    if (!isFlag(argv[i])) continue;
     bool ok = false;
     for (int k = 0; k < allowedN; k++)
     {
-      if (streqi(argv[i], allowed[k]))
-      {
-        ok = true;
-        break;
-      }
+      if (streqi(argv[i], allowed[k])) { ok = true; break; }
     }
     if (!ok)
     {
@@ -1138,8 +1319,7 @@ bool checkNoUnknownFlags(int argc, char *argv[], const char *allowed[], int allo
 
 bool parseFloat(const char *s, float &out)
 {
-  if (!s || !*s)
-    return false;
+  if (!s || !*s) return false;
   char *end = nullptr;
   out = strtof(s, &end);
   return end && *end == '\0';
@@ -1147,12 +1327,10 @@ bool parseFloat(const char *s, float &out)
 
 bool parseInt(const char *s, int &out)
 {
-  if (!s || !*s)
-    return false;
+  if (!s || !*s) return false;
   char *end = nullptr;
   long v = strtol(s, &end, 10);
-  if (!(end && *end == '\0'))
-    return false;
+  if (!(end && *end == '\0')) return false;
   out = (int)v;
   return true;
 }
@@ -1177,375 +1355,164 @@ void helpMain()
   Serial.println("  esc calibrate | esc calibrate stop");
 }
 
-void helpMotor()
-{
-  Serial.println("HELP MOTOR");
-  Serial.println("  motor arm");
-  Serial.println("  motor disarm");
-  Serial.println("  motor estop");
-  Serial.println("  motor set --thr f     (0..1)");
-  Serial.println("  motor set --us  n     (1000..2000)");
-  Serial.println("  motor manual --thr f --sec s [--no-log]");
-}
-
-void helpSweep()
-{
-  Serial.println("HELP SWEEP");
-  Serial.println("  sweep stop");
-  Serial.println("  sweep step --start a --stop b --step c --hold s [--ramp r]");
-  Serial.println("  sweep ramp --start a --stop b --dur s");
-  Serial.println("  sweep tri  --min a --max b --period s --cycles n");
-}
-
-void helpLog()
-{
-  Serial.println("HELP LOG");
-  Serial.println("  log start");
-  Serial.println("  log stop");
-}
-
-void helpEsc()
-{
-  Serial.println("HELP ESC");
-  Serial.println("  status esc");
-  Serial.println("  esc set --freq Hz            (50..500)");
-  Serial.println("  esc calibrate                (run BEFORE plugging ESC battery)");
-  Serial.println("  esc calibrate stop           (abort)");
-}
+void helpMotor(){ Serial.println("HELP MOTOR"); }
+void helpSweep(){ Serial.println("HELP SWEEP"); }
+void helpLog(){ Serial.println("HELP LOG"); }
+void helpEsc(){ Serial.println("HELP ESC"); }
 
 // -------- STATUS --------
 void printMotorStatus()
 {
-  Serial.print("MOTOR armed=");
-  Serial.print(motorArmed ? "true" : "false");
-  Serial.print(" mode=");
-  Serial.print(motorModeName(motorMode));
-  Serial.print(" thr_target=");
-  Serial.print(thrTarget, 4);
-  Serial.print(" thr_cmd=");
-  Serial.print(thrCmd, 4);
-  Serial.print(" esc_us=");
-  Serial.print(currentEscUs());
-  Serial.print(" rpm=");
-  Serial.println(rpmValue);
+  Serial.print("MOTOR armed="); Serial.print(motorArmed ? "true" : "false");
+  Serial.print(" mode="); Serial.print(motorModeName(motorMode));
+  Serial.print(" thr_target="); Serial.print(thrTarget, 4);
+  Serial.print(" thr_cmd="); Serial.print(thrCmd, 4);
+  Serial.print(" esc_us="); Serial.print(currentEscUs());
+  Serial.print(" rpm="); Serial.println(rpmValue);
 }
 
 void printEscStatus()
 {
-  Serial.print("ESC freq_hz=");
-  Serial.print(escFreqHz);
-  Serial.print(" us=");
-  Serial.print(currentEscUs());
-  Serial.print(" cal_state=");
-  Serial.println(escCalName(escCalState));
+  Serial.print("ESC freq_hz="); Serial.print(escFreqHz);
+  Serial.print(" us="); Serial.print(currentEscUs());
+  Serial.print(" cal_state="); Serial.println(escCalName(escCalState));
 }
 
 void printStatus()
 {
-  Serial.print("STATUS sd=");
-  Serial.print(sdOk ? "ok" : "fail");
-  Serial.print(" run=");
-  Serial.print(runNumber);
-  Serial.print(" log=");
-  Serial.print(loggingEnabled ? "on" : "off");
+  Serial.print("STATUS sd="); Serial.print(sdOk ? "ok" : "fail");
+  Serial.print(" run="); Serial.print(runNumber);
+  Serial.print(" log="); Serial.print(loggingEnabled ? "on" : "off");
   Serial.print(" baseline=");
-  if (baselineValid)
-    Serial.print(vibBaseline, 6);
-  else
-    Serial.print("nan");
-  Serial.print(" vibrms=");
-  Serial.print(vibRms, 6);
-  Serial.print(" vibnet=");
-  Serial.print(vibNet, 6);
-  Serial.print(" motor=\"");
-  Serial.print(motorId);
-  Serial.print("\"");
-  Serial.print(" notes=\"");
-  Serial.print(notes);
-  Serial.println("\"");
+  if (baselineValid) Serial.print(vibBaseline, 6); else Serial.print("nan");
+  Serial.print(" vibrms="); Serial.print(vibRms, 6);
+  Serial.print(" vibnet="); Serial.print(vibNet, 6);
+  Serial.print(" motor=\""); Serial.print(motorId); Serial.print("\"");
+  Serial.print(" notes=\""); Serial.print(notes); Serial.println("\"");
 }
 
-// -------- DISPATCH (STRICT / NO SIDE EFFECTS ON ERR) --------
+// -------- DISPATCH --------
 void handleCliLine(char *line)
 {
   char *argv[CLI_ARGV_MAX];
   int argc = tokenize(line, argv, CLI_ARGV_MAX);
-  if (argc == -1)
-  {
-    Serial.println("ERR too_many_args");
-    return;
-  }
-  if (argc == -2)
-  {
-    Serial.println("ERR missing_quote");
-    return;
-  }
-  if (argc == 0)
-    return;
+  if (argc == -1) { Serial.println("ERR too_many_args"); return; }
+  if (argc == -2) { Serial.println("ERR missing_quote"); return; }
+  if (argc == 0) return;
 
-  if (streqi(argv[0], "HELP"))
-  {
-    if (argc == 1)
-    {
-      helpMain();
-      return;
-    }
-    if (streqi(argv[1], "MOTOR"))
-    {
-      helpMotor();
-      return;
-    }
-    if (streqi(argv[1], "SWEEP"))
-    {
-      helpSweep();
-      return;
-    }
-    if (streqi(argv[1], "LOG"))
-    {
-      helpLog();
-      return;
-    }
-    if (streqi(argv[1], "ESC"))
-    {
-      helpEsc();
-      return;
-    }
-    Serial.println("ERR help_topic");
-    return;
-  }
+  if (streqi(argv[0], "HELP")) { helpMain(); return; }
 
   if (streqi(argv[0], "STATUS"))
   {
-    if (argc == 1)
-    {
-      printStatus();
-      Serial.println("OK");
-      return;
-    }
-    if (argc == 2 && streqi(argv[1], "MOTOR"))
-    {
-      printMotorStatus();
-      Serial.println("OK");
-      return;
-    }
-    if (argc == 2 && streqi(argv[1], "ESC"))
-    {
-      printEscStatus();
-      Serial.println("OK");
-      return;
-    }
-    Serial.println("ERR status_syntax");
-    return;
+    if (argc == 1) { printStatus(); Serial.println("OK"); return; }
+    if (argc == 2 && streqi(argv[1], "MOTOR")) { printMotorStatus(); Serial.println("OK"); return; }
+    if (argc == 2 && streqi(argv[1], "ESC")) { printEscStatus(); Serial.println("OK"); return; }
+    Serial.println("ERR status_syntax"); return;
   }
 
-  // LOG (STRICT; no flags; no side effects on ERR)
+  // LOG
   if (streqi(argv[0], "LOG"))
   {
-    if (argc != 2)
-    {
-      Serial.println("ERR log_syntax");
-      return;
-    }
-    if (isFlag(argv[1]))
-    {
-      Serial.println("ERR log_syntax");
-      return;
-    }
-
-    if (streqi(argv[1], "START"))
-    {
-      (void)startLogging();
-      return;
-    }
-    if (streqi(argv[1], "STOP"))
-    {
-      stopLogging();
-      return;
-    }
-    Serial.println("ERR log_syntax");
-    return;
+    if (argc != 2 || isFlag(argv[1])) { Serial.println("ERR log_syntax"); return; }
+    if (streqi(argv[1], "START")) { setTest(TEST_LOG_ONLY, "log_only"); (void)startLogging(); return; }
+    if (streqi(argv[1], "STOP")) { stopLogging(); return; }
+    Serial.println("ERR log_syntax"); return;
   }
 
   if (streqi(argv[0], "BASE"))
   {
-    if (argc < 2 || !streqi(argv[1], "CAPTURE"))
-    {
-      Serial.println("ERR base_syntax");
-      return;
-    }
+    if (argc < 2 || !streqi(argv[1], "CAPTURE")) { Serial.println("ERR base_syntax"); return; }
     const char *allowed[] = {"--windows", "-w"};
-    if (!checkNoUnknownFlags(argc, argv, allowed, 2))
-      return;
+    if (!checkNoUnknownFlags(argc, argv, allowed, 2)) return;
 
     bool ok = true;
     int windows = BASELINE_WINDOWS_DEFAULT;
     const char *wv = optValue(argc, argv, "-w", "--windows", ok);
-    if (!ok)
-    {
-      Serial.println("ERR windows_requires_value");
-      return;
-    }
-    if (wv)
-    {
-      if (!parseInt(wv, windows))
-      {
-        Serial.println("ERR windows_not_int");
-        return;
-      }
-    }
+    if (!ok) { Serial.println("ERR windows_requires_value"); return; }
+    if (wv && !parseInt(wv, windows)) { Serial.println("ERR windows_not_int"); return; }
     startBaselineCapture(windows);
     return;
   }
 
   if (streqi(argv[0], "SET"))
   {
-    if (argc < 3)
-    {
-      Serial.println("ERR set_syntax");
-      return;
-    }
+    if (argc < 3) { Serial.println("ERR set_syntax"); return; }
     if (streqi(argv[1], "MOTOR"))
     {
-      strncpy(motorId, argv[2], sizeof(motorId) - 1);
-      motorId[sizeof(motorId) - 1] = '\0';
-      Serial.println("OK");
-      statusBar("FIELD UPDATED", C_OK);
-      return;
+      strncpy(motorId, argv[2], sizeof(motorId)-1);
+      motorId[sizeof(motorId)-1] = '\0';
+      Serial.println("OK"); statusBar("FIELD UPDATED", C_OK); return;
     }
     if (streqi(argv[1], "NOTES"))
     {
-      strncpy(notes, argv[2], sizeof(notes) - 1);
-      notes[sizeof(notes) - 1] = '\0';
-      Serial.println("OK");
-      statusBar("FIELD UPDATED", C_OK);
-      return;
+      strncpy(notes, argv[2], sizeof(notes)-1);
+      notes[sizeof(notes)-1] = '\0';
+      Serial.println("OK"); statusBar("FIELD UPDATED", C_OK); return;
     }
-    Serial.println("ERR set_target");
-    return;
+    Serial.println("ERR set_target"); return;
   }
 
-  // ESC commands
   if (streqi(argv[0], "ESC"))
   {
-    if (argc < 2)
-    {
-      Serial.println("ERR esc_syntax");
-      return;
-    }
+    if (argc < 2) { Serial.println("ERR esc_syntax"); return; }
 
     if (streqi(argv[1], "SET"))
     {
       const char *allowed[] = {"--freq", "-f"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 2))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 2)) return;
 
       bool ok = true;
       const char *fv = optValue(argc, argv, "-f", "--freq", ok);
-      if (!ok)
-      {
-        Serial.println("ERR freq_requires_value");
-        return;
-      }
-      if (!fv)
-      {
-        Serial.println("ERR esc_set_requires_freq");
-        return;
-      }
+      if (!ok) { Serial.println("ERR freq_requires_value"); return; }
+      if (!fv) { Serial.println("ERR esc_set_requires_freq"); return; }
 
       int hz;
-      if (!parseInt(fv, hz))
-      {
-        Serial.println("ERR freq_not_int");
-        return;
-      }
+      if (!parseInt(fv, hz)) { Serial.println("ERR freq_not_int"); return; }
       (void)escSetFrequency((uint32_t)hz);
       return;
     }
 
     if (streqi(argv[1], "CALIBRATE"))
     {
-      if (argc == 2)
-      {
-        escCalStart();
-        return;
-      }
-      if (argc == 3 && streqi(argv[2], "STOP"))
-      {
-        escCalStop();
-        return;
-      }
-      Serial.println("ERR esc_cal_syntax");
-      return;
+      if (argc == 2) { escCalStart(); return; }
+      if (argc == 3 && streqi(argv[2], "STOP")) { escCalStop(); return; }
+      Serial.println("ERR esc_cal_syntax"); return;
     }
 
-    Serial.println("ERR esc_subcommand");
-    return;
+    Serial.println("ERR esc_subcommand"); return;
   }
 
-  // MOTOR commands
   if (streqi(argv[0], "MOTOR"))
   {
-    if (argc < 2)
-    {
-      Serial.println("ERR motor_syntax");
-      return;
-    }
+    if (argc < 2) { Serial.println("ERR motor_syntax"); return; }
 
     if (streqi(argv[1], "ARM"))
     {
-      if (argc != 2)
-      {
-        Serial.println("ERR motor_arm_syntax");
-        return;
-      }
-      if (escCalState != ESC_CAL_OFF)
-      {
-        Serial.println("ERR esc_cal_active");
-        return;
-      }
-      motorArm();
-      return;
+      if (argc != 2) { Serial.println("ERR motor_arm_syntax"); return; }
+      if (escCalState != ESC_CAL_OFF) { Serial.println("ERR esc_cal_active"); return; }
+      motorArm(); return;
     }
     if (streqi(argv[1], "DISARM"))
     {
-      if (argc != 2)
-      {
-        Serial.println("ERR motor_disarm_syntax");
-        return;
-      }
-      motorDisarm("MOTOR DISARM");
-      return;
+      if (argc != 2) { Serial.println("ERR motor_disarm_syntax"); return; }
+      motorDisarm("MOTOR DISARM"); return;
     }
     if (streqi(argv[1], "ESTOP"))
     {
-      if (argc != 2)
-      {
-        Serial.println("ERR motor_estop_syntax");
-        return;
-      }
-      motorDisarm("E-STOP");
-      return;
+      if (argc != 2) { Serial.println("ERR motor_estop_syntax"); return; }
+      motorDisarm("E-STOP"); return;
     }
 
     if (streqi(argv[1], "SET"))
     {
       const char *allowed[] = {"--thr", "-t", "--us", "-u"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 4))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 4)) return;
 
       bool okT = true, okU = true;
       const char *tv = optValue(argc, argv, "-t", "--thr", okT);
       const char *uv = optValue(argc, argv, "-u", "--us", okU);
-      if (!okT)
-      {
-        Serial.println("ERR thr_requires_value");
-        return;
-      }
-      if (!okU)
-      {
-        Serial.println("ERR us_requires_value");
-        return;
-      }
+      if (!okT) { Serial.println("ERR thr_requires_value"); return; }
+      if (!okU) { Serial.println("ERR us_requires_value"); return; }
 
       if ((tv && uv) || (!tv && !uv))
       {
@@ -1562,14 +1529,15 @@ void handleCliLine(char *line)
       if (tv)
       {
         float t;
-        if (!parseFloat(tv, t))
-        {
-          Serial.println("ERR thr_not_float");
-          return;
-        }
+        if (!parseFloat(tv, t)) { Serial.println("ERR thr_not_float"); return; }
         thrTarget = clamp01(t);
         motorMode = MOTOR_MANUAL;
         manualTimerActive = false;
+
+        // ✅ tagging implemented here
+        setTest(TEST_MANUAL_SET, "manual_set");
+        test_a = thrTarget;
+
         Serial.println("OK");
         return;
       }
@@ -1577,15 +1545,16 @@ void handleCliLine(char *line)
       if (uv)
       {
         int us;
-        if (!parseInt(uv, us))
-        {
-          Serial.println("ERR us_not_int");
-          return;
-        }
+        if (!parseInt(uv, us)) { Serial.println("ERR us_not_int"); return; }
         us = clampInt(us, ESC_MIN_US, ESC_MAX_US);
         thrTarget = clamp01((float)(us - ESC_MIN_US) / (float)(ESC_MAX_US - ESC_MIN_US));
         motorMode = MOTOR_MANUAL;
         manualTimerActive = false;
+
+        // ✅ tagging implemented here
+        setTest(TEST_MANUAL_SET, "manual_set");
+        test_a = thrTarget;
+
         Serial.println("OK");
         return;
       }
@@ -1594,41 +1563,20 @@ void handleCliLine(char *line)
     if (streqi(argv[1], "MANUAL"))
     {
       const char *allowed[] = {"--thr", "-t", "--sec", "-s", "--no-log"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 5))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 5)) return;
 
       bool okT = true, okS = true;
       const char *tv = optValue(argc, argv, "-t", "--thr", okT);
       const char *sv = optValue(argc, argv, "-s", "--sec", okS);
       bool noLog = hasFlag(argc, argv, nullptr, "--no-log");
 
-      if (!okT)
-      {
-        Serial.println("ERR thr_requires_value");
-        return;
-      }
-      if (!okS)
-      {
-        Serial.println("ERR sec_requires_value");
-        return;
-      }
-      if (!tv || !sv)
-      {
-        Serial.println("ERR manual_requires_thr_and_sec");
-        return;
-      }
+      if (!okT) { Serial.println("ERR thr_requires_value"); return; }
+      if (!okS) { Serial.println("ERR sec_requires_value"); return; }
+      if (!tv || !sv) { Serial.println("ERR manual_requires_thr_and_sec"); return; }
 
       float t, s;
-      if (!parseFloat(tv, t))
-      {
-        Serial.println("ERR thr_not_float");
-        return;
-      }
-      if (!parseFloat(sv, s))
-      {
-        Serial.println("ERR sec_not_float");
-        return;
-      }
+      if (!parseFloat(tv, t)) { Serial.println("ERR thr_not_float"); return; }
+      if (!parseFloat(sv, s)) { Serial.println("ERR sec_not_float"); return; }
 
       startManualTimed(t, s, noLog);
       return;
@@ -1638,86 +1586,40 @@ void handleCliLine(char *line)
     return;
   }
 
-  // SWEEP commands
   if (streqi(argv[0], "SWEEP"))
   {
-    if (argc < 2)
-    {
-      Serial.println("ERR sweep_syntax");
-      return;
-    }
+    if (argc < 2) { Serial.println("ERR sweep_syntax"); return; }
 
     if (streqi(argv[1], "STOP"))
     {
-      if (argc != 2)
-      {
-        Serial.println("ERR sweep_stop_syntax");
-        return;
-      }
-      sweepStop();
-      return;
+      if (argc != 2) { Serial.println("ERR sweep_stop_syntax"); return; }
+      sweepStop(); return;
     }
 
     if (streqi(argv[1], "STEP"))
     {
       const char *allowed[] = {"--start", "-a", "--stop", "-b", "--step", "-p", "--hold", "-h", "--ramp", "-r"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 10))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 10)) return;
 
       bool ok = true;
       const char *sa = optValue(argc, argv, "-a", "--start", ok);
-      if (!ok)
-      {
-        Serial.println("ERR start_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR start_requires_value"); return; }
       const char *sb = optValue(argc, argv, "-b", "--stop", ok);
-      if (!ok)
-      {
-        Serial.println("ERR stop_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR stop_requires_value"); return; }
       const char *sp = optValue(argc, argv, "-p", "--step", ok);
-      if (!ok)
-      {
-        Serial.println("ERR step_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR step_requires_value"); return; }
       const char *sh = optValue(argc, argv, "-h", "--hold", ok);
-      if (!ok)
-      {
-        Serial.println("ERR hold_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR hold_requires_value"); return; }
       const char *sr = optValue(argc, argv, "-r", "--ramp", ok);
-      if (!ok)
-      {
-        Serial.println("ERR ramp_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR ramp_requires_value"); return; }
 
-      if (!sa || !sb || !sp || !sh)
-      {
-        Serial.println("ERR sweep_step_requires_start_stop_step_hold");
-        return;
-      }
+      if (!sa || !sb || !sp || !sh) { Serial.println("ERR sweep_step_requires_start_stop_step_hold"); return; }
 
       float a, b, c, hold, ramp;
       if (!parseFloat(sa, a) || !parseFloat(sb, b) || !parseFloat(sp, c) || !parseFloat(sh, hold))
-      {
-        Serial.println("ERR sweep_step_bad_number");
-        return;
-      }
-      if (sr)
-      {
-        if (!parseFloat(sr, ramp))
-        {
-          Serial.println("ERR ramp_not_float");
-          return;
-        }
-      }
-      else
-        ramp = rampRate;
+      { Serial.println("ERR sweep_step_bad_number"); return; }
+      if (sr) { if (!parseFloat(sr, ramp)) { Serial.println("ERR ramp_not_float"); return; } }
+      else ramp = rampRate;
 
       sweepStartStep(a, b, c, hold, ramp);
       return;
@@ -1726,41 +1628,22 @@ void handleCliLine(char *line)
     if (streqi(argv[1], "RAMP"))
     {
       const char *allowed[] = {"--start", "-a", "--stop", "-b", "--dur", "-d"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 6))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 6)) return;
 
       bool ok = true;
       const char *sa = optValue(argc, argv, "-a", "--start", ok);
-      if (!ok)
-      {
-        Serial.println("ERR start_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR start_requires_value"); return; }
       const char *sb = optValue(argc, argv, "-b", "--stop", ok);
-      if (!ok)
-      {
-        Serial.println("ERR stop_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR stop_requires_value"); return; }
       const char *sd = optValue(argc, argv, "-d", "--dur", ok);
-      if (!ok)
-      {
-        Serial.println("ERR dur_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR dur_requires_value"); return; }
 
-      if (!sa || !sb || !sd)
-      {
-        Serial.println("ERR sweep_ramp_requires_start_stop_dur");
-        return;
-      }
+      if (!sa || !sb || !sd) { Serial.println("ERR sweep_ramp_requires_start_stop_dur"); return; }
 
       float a, b, dur;
       if (!parseFloat(sa, a) || !parseFloat(sb, b) || !parseFloat(sd, dur))
-      {
-        Serial.println("ERR sweep_ramp_bad_number");
-        return;
-      }
+      { Serial.println("ERR sweep_ramp_bad_number"); return; }
+
       sweepStartRamp(a, b, dur);
       return;
     }
@@ -1768,48 +1651,26 @@ void handleCliLine(char *line)
     if (streqi(argv[1], "TRI"))
     {
       const char *allowed[] = {"--min", "-m", "--max", "-x", "--period", "-p", "--cycles", "-c"};
-      if (!checkNoUnknownFlags(argc, argv, allowed, 8))
-        return;
+      if (!checkNoUnknownFlags(argc, argv, allowed, 8)) return;
 
       bool ok = true;
       const char *smin = optValue(argc, argv, "-m", "--min", ok);
-      if (!ok)
-      {
-        Serial.println("ERR min_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR min_requires_value"); return; }
       const char *smax = optValue(argc, argv, "-x", "--max", ok);
-      if (!ok)
-      {
-        Serial.println("ERR max_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR max_requires_value"); return; }
       const char *sper = optValue(argc, argv, "-p", "--period", ok);
-      if (!ok)
-      {
-        Serial.println("ERR period_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR period_requires_value"); return; }
       const char *scyc = optValue(argc, argv, "-c", "--cycles", ok);
-      if (!ok)
-      {
-        Serial.println("ERR cycles_requires_value");
-        return;
-      }
+      if (!ok) { Serial.println("ERR cycles_requires_value"); return; }
 
       if (!smin || !smax || !sper || !scyc)
-      {
-        Serial.println("ERR sweep_tri_requires_min_max_period_cycles");
-        return;
-      }
+      { Serial.println("ERR sweep_tri_requires_min_max_period_cycles"); return; }
 
       float a, b, per;
       int cyc;
       if (!parseFloat(smin, a) || !parseFloat(smax, b) || !parseFloat(sper, per) || !parseInt(scyc, cyc))
-      {
-        Serial.println("ERR sweep_tri_bad_number");
-        return;
-      }
+      { Serial.println("ERR sweep_tri_bad_number"); return; }
+
       sweepStartTri(a, b, per, cyc);
       return;
     }
@@ -1826,8 +1687,7 @@ void pollCli()
   while (Serial.available())
   {
     char c = (char)Serial.read();
-    if (c == '\r')
-      continue;
+    if (c == '\r') continue;
 
     if (c == '\n')
     {
@@ -1837,15 +1697,8 @@ void pollCli()
       continue;
     }
 
-    if (cliLen < CLI_LINE_MAX - 1)
-    {
-      cliLine[cliLen++] = c;
-    }
-    else
-    {
-      cliLen = 0;
-      Serial.println("ERR line_too_long");
-    }
+    if (cliLen < CLI_LINE_MAX - 1) cliLine[cliLen++] = c;
+    else { cliLen = 0; Serial.println("ERR line_too_long"); }
   }
 }
 
@@ -1854,7 +1707,9 @@ void setup()
 {
   Serial.begin(115200);
 
+  pinMode(TFT_CS, OUTPUT);
   pinMode(SD_CS, OUTPUT);
+  digitalWrite(TFT_CS, HIGH);
   pinMode(TOUCH_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
   digitalWrite(TOUCH_CS, HIGH);
@@ -1869,29 +1724,19 @@ void setup()
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);
 
-  // WHO_AM_I
   uint8_t w = 0;
-  if (readRegs(0x75, &w, 1))
-    whoami = w;
+  if (readRegs(0x75, &w, 1)) whoami = w;
 
-  // IMU config
   writeReg(0x6B, 0x00);
   delay(50);
-  writeReg(0x1C, 0x10); // accel +/-8g
-  writeReg(0x1B, 0x08); // gyro +/-500 dps
+  writeReg(0x1C, 0x10);
+  writeReg(0x1B, 0x08);
 
-  // SD init
   sdOk = SD.begin(SD_CS, SPI, 25000000);
-  if (sdOk)
-    runNumber = findNextRunNumber();
+  if (sdOk) runNumber = findNextRunNumber();
 
-  // LEDC init (legacy API for widest compatibility)
   ledcSetup(ESC_LEDC_CH, ESC_FREQ_HZ_DEFAULT, ESC_LEDC_RES_BITS);
   ledcAttachPin(ESC_PIN, ESC_LEDC_CH);
-  bool ledcOk = true;
-
-  escFreqHz = ESC_FREQ_HZ_DEFAULT;
-  escWriteUs(ESC_MIN_US);
 
   escFreqHz = ESC_FREQ_HZ_DEFAULT;
   escWriteUs(ESC_MIN_US);
@@ -1988,7 +1833,6 @@ void loop()
 
     char buf[24];
 
-    // left values (bounded)
     if (fabsf(ax - ax_d) > AX_EPS)
     {
       ax_d = ax;
@@ -2025,7 +1869,6 @@ void loop()
       drawValueText2(vx1, vy0 + 4 * ROW_H, buf, C_VALUE);
     }
 
-    // right values
     if (sdOk != sdOk_d)
     {
       sdOk_d = sdOk;
@@ -2042,14 +1885,8 @@ void loop()
     {
       mode_d = motorMode;
       char mbuf[14];
-      if (escCalState != ESC_CAL_OFF)
-      {
-        snprintf(mbuf, sizeof(mbuf), "C %s", escCalName(escCalState));
-      }
-      else
-      {
-        snprintf(mbuf, sizeof(mbuf), "%c %s", motorArmed ? 'A' : 'D', motorModeName(motorMode));
-      }
+      if (escCalState != ESC_CAL_OFF) snprintf(mbuf, sizeof(mbuf), "C %s", escCalName(escCalState));
+      else snprintf(mbuf, sizeof(mbuf), "%c %s", motorArmed ? 'A' : 'D', motorModeName(motorMode));
       drawValueText2Fixed(vx2, vy0 + 2 * ROW_H, mbuf, rightValueWChars,
                           (escCalState != ESC_CAL_OFF) ? C_WARN : (motorArmed ? C_OK : C_WARN));
     }
@@ -2068,14 +1905,11 @@ void loop()
     {
       rpm_d = rpmValue;
       char rbuf2[14];
-      if (rpmValue < 0)
-        snprintf(rbuf2, sizeof(rbuf2), "N/A");
-      else
-        snprintf(rbuf2, sizeof(rbuf2), "%ld", (long)rpmValue);
+      if (rpmValue < 0) snprintf(rbuf2, sizeof(rbuf2), "N/A");
+      else snprintf(rbuf2, sizeof(rbuf2), "%ld", (long)rpmValue);
       drawValueText2Fixed(vx2, vy0 + 4 * ROW_H, rbuf2, rightValueWChars, C_VALUE);
     }
 
-    // meta
     if (strcmp(motorId, motor_d) != 0)
     {
       strncpy(motor_d, motorId, sizeof(motor_d) - 1);
@@ -2113,10 +1947,32 @@ void loop()
   {
     nl += LOG_MS;
 
-    if (loggingEnabled && logFile)
+    if (loggingEnabled && logCsvIsOpen())
     {
       float mag = sqrtf(ax * ax + ay * ay + az * az);
       int esc_us = currentEscUs();
+
+      // live stats
+      logSamplesTotal++;
+      statFUpdate(st_vib_inst, vibInst);
+      statFUpdate(st_vib_rms, vibRms);
+      statFUpdate(st_vib_net, vibNet);
+      statFUpdate(st_thr_cmd, thrCmd);
+      statFUpdate(st_esc_us, (float)esc_us);
+
+      // heap min tracking
+      uint32_t hm = ESP.getMinFreeHeap();
+      if (hm < heapMinSeen) heapMinSeen = hm;
+
+      // peaks
+      uint32_t tms = (uint32_t)millis();
+      if (!vibInstPeakMs || vibInst > vibInstPeakVal) { vibInstPeakVal = vibInst; vibInstPeakMs = tms; }
+      if (rpmValue >= 0)
+      {
+        logSamplesRpmValid++;
+        statIUpdate(st_rpm, rpmValue);
+        if (rpmPeakVal < 0 || rpmValue > rpmPeakVal) { rpmPeakVal = rpmValue; rpmPeakMs = tms; }
+      }
 
       char line[280];
       int n = snprintf(line, sizeof(line),
@@ -2138,6 +1994,5 @@ void loop()
     }
   }
 
-  // ---- CLI ----
   pollCli();
 }

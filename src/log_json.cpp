@@ -6,15 +6,16 @@ static void spiSelectSd(int tftCsPin, int sdCsPin){
   digitalWrite(tftCsPin, HIGH);
   digitalWrite(sdCsPin, LOW);
 }
+
 static void spiDeselectSd(int tftCsPin, int sdCsPin){
   digitalWrite(sdCsPin, HIGH);
   digitalWrite(tftCsPin, HIGH);
 }
 
 static void jsonWriteEscaped(File& f, const char* s){
-  if(!s){ f.print(""); return; }
-  for(const char* p=s; *p; ++p){
-    const char c=*p;
+  if(!s) { f.print(""); return; }
+  for(const char* p = s; *p; ++p){
+    const char c = *p;
     switch(c){
       case '\"': f.print("\\\""); break;
       case '\\': f.print("\\\\"); break;
@@ -37,11 +38,13 @@ bool logJsonOpen(const char* filename, int tftCsPin, int sdCsPin){
   spiSelectSd(tftCsPin, sdCsPin);
   s_json = SD.open(filename, FILE_WRITE);
   spiDeselectSd(tftCsPin, sdCsPin);
+
   if(!s_json) return false;
 
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.println("{");
   spiDeselectSd(tftCsPin, sdCsPin);
+
   return true;
 }
 
@@ -56,6 +59,7 @@ static void writeKeyPrefix(const char* key, int tftCsPin, int sdCsPin){
 void logJsonWriteKeyValueStr(const char* key, const char* value, int tftCsPin, int sdCsPin){
   if(!s_json || !key) return;
   writeKeyPrefix(key, tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print("\"");
   jsonWriteEscaped(s_json, value ? value : "");
@@ -66,6 +70,7 @@ void logJsonWriteKeyValueStr(const char* key, const char* value, int tftCsPin, i
 void logJsonWriteKeyValueU32(const char* key, uint32_t value, int tftCsPin, int sdCsPin){
   if(!s_json || !key) return;
   writeKeyPrefix(key, tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print(value);
   s_json.println(",");
@@ -75,6 +80,7 @@ void logJsonWriteKeyValueU32(const char* key, uint32_t value, int tftCsPin, int 
 void logJsonWriteKeyValueI32(const char* key, int32_t value, int tftCsPin, int sdCsPin){
   if(!s_json || !key) return;
   writeKeyPrefix(key, tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print(value);
   s_json.println(",");
@@ -85,7 +91,9 @@ void logJsonWriteKeyValueF(const char* key, float value, int decimals, int tftCs
   if(!s_json || !key) return;
   if(decimals < 0) decimals = 0;
   if(decimals > 9) decimals = 9;
+
   writeKeyPrefix(key, tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print(value, decimals);
   s_json.println(",");
@@ -95,6 +103,7 @@ void logJsonWriteKeyValueF(const char* key, float value, int decimals, int tftCs
 void logJsonWriteKeyValueBool(const char* key, bool value, int tftCsPin, int sdCsPin){
   if(!s_json || !key) return;
   writeKeyPrefix(key, tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print(value ? "true" : "false");
   s_json.println(",");
@@ -103,7 +112,9 @@ void logJsonWriteKeyValueBool(const char* key, bool value, int tftCsPin, int sdC
 
 void logJsonWriteColumns(const char* const* cols, size_t n, int tftCsPin, int sdCsPin){
   if(!s_json || !cols) return;
+
   writeKeyPrefix("columns", tftCsPin, sdCsPin);
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print("[");
   for(size_t i=0;i<n;i++){
@@ -117,16 +128,22 @@ void logJsonWriteColumns(const char* const* cols, size_t n, int tftCsPin, int sd
 }
 
 void logJsonBeginObject(const char* keyOrNull, int tftCsPin, int sdCsPin){
-  if(!s_json || !keyOrNull) return;
+  if(!s_json) return;
+
   spiSelectSd(tftCsPin, sdCsPin);
-  s_json.print("  \"");
-  jsonWriteEscaped(s_json, keyOrNull);
-  s_json.println("\": {");
+  if(keyOrNull){
+    s_json.print("  \"");
+    jsonWriteEscaped(s_json, keyOrNull);
+    s_json.println("\": {");
+  } else {
+    s_json.println("{");
+  }
   spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonEndObject(bool trailingComma, int tftCsPin, int sdCsPin){
   if(!s_json) return;
+
   spiSelectSd(tftCsPin, sdCsPin);
   if(trailingComma) s_json.println("  },");
   else              s_json.println("  }");
@@ -135,6 +152,7 @@ void logJsonEndObject(bool trailingComma, int tftCsPin, int sdCsPin){
 
 void logJsonCloseWithStopMs(uint32_t stopMs, int tftCsPin, int sdCsPin){
   if(!s_json) return;
+
   spiSelectSd(tftCsPin, sdCsPin);
   s_json.print("  \"stop_ms\": ");
   s_json.println(stopMs);
