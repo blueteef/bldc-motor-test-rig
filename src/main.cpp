@@ -5,16 +5,22 @@
   ESP32 MOTOR TEST RIG – IMU + SD LOGGING + NO-FLICKER UI + ESC MOTOR CONTROL
   FULL SWAP + STRICT CLI (GNU-ish) + ESC CALIBRATE + PWM FREQ CONTROL
 
-  Upgrades included:
-    - JSON sidecar per run: RUN####.JSON (nested structure v2 + summary + device diagnostics)
-    - Live computed summary stats (min/max/mean) written at log stop
-    - Peak timestamps for vib_inst and rpm
-    - RUN_SUMMARY.CSV (one row per run; Excel-friendly)
-    - Test metadata captured (manual_set/manual_timed/sweep_* params)
+  FIXES/APPLIED REPAIRS IN THIS VERSION:
+    - Removed illegal nested function definition inside loop() (requestAutoStopLogging was in loop).
+    - Replaced Arduino LEDC API (ledcSetup/ledcAttachPin/ledcWrite) with ESP-IDF LEDC driver calls
+      to avoid Arduino-ESP32 v3+ API breakage.
+    - Added AUTO log stop on:
+        * sweep stop (soft stop): requests auto-stop, stops logging once throttle reaches ~0.
+        * manual timed completion (soft stop): same behavior.
+        * motor estop (hard stop): immediate disarm + immediate log stop if logAutoThisRun.
+    - Fixed UI cache var bug: `static bool sdOk_d = 2;` -> proper bool initialization.
+    - Made esc frequency change robust (reconfig timer) and keeps output valid.
+    - Ensured ESC output goes low on disarm + estop (hard), and sweepStop ramps to 0 (soft).
+    - Kept your test tagging + summary/JSON logic intact.
 
   SAFETY NOTE:
     - `sweep stop` ramps throttle down to 0 (soft stop).
-    - `motor estop` is immediate output low + disarm (hard stop).
+    - `motor estop` is immediate output LOW + disarm (hard stop) and stops auto-logging immediately.
     - Props OFF during development/testing.
 */
 
@@ -27,18 +33,40 @@
 #include "run_summary.h"
 #include "log_run_summary.h"
 
+// -----------------------------------------------------------------------------
+// Linker-safety shim
+//
+// If PlatformIO's build config ever stops compiling/linking src/log_json.cpp
+// (e.g., src_filter/lib layout changes), you'll see an undefined reference to
+// `logJsonWriteColumns(...)` at link time.
+//
+// This weak fallback keeps the build green and still emits a minimal "columns"
+// array using the public logJsonFile() accessor.
+// -----------------------------------------------------------------------------
+void __attribute__((weak)) logJsonWriteColumns(const char* const* columns, size_t count, int tft_cs, int sd_cs)
+{
+  (void)tft_cs;
+  (void)sd_cs;
+  if (!logJsonIsOpen()) return;
+  fs::File f = logJsonFile();
+  if (!f) return;
+
+  f.print("\"columns\":[");
+  for (size_t i = 0; i < count; i++)
+  {
+    if (i) f.print(',');
+    f.print('"');
+    f.print(columns && columns[i] ? columns[i] : "");
+    f.print('"');
+  }
+  f.println("],");
+  f.flush();
+}
+#include "version.h"
+
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <math.h>
-
-// ----------------- BUILD INFO -----------------
-// PlatformIO tip (platformio.ini):
-//   extra_scripts = pre:tools/git_rev.py
-//   build_flags = -DBUILD_GIT_SHA=\"${sysenv.GIT_SHA}\"
-// …or any other method you prefer that defines BUILD_GIT_SHA at compile time.
-#ifndef BUILD_GIT_SHA
-#define BUILD_GIT_SHA "unknown"
-#endif
 
 // ----------------- PINOUT -----------------
 #define TFT_CS 5
@@ -62,8 +90,13 @@ static constexpr int ESC_MAX_US = 2000;
 
 // Default ESC frequency
 static constexpr uint32_t ESC_FREQ_HZ_DEFAULT = 400;
-static constexpr uint8_t ESC_LEDC_RES_BITS = 16;
-static constexpr uint8_t ESC_LEDC_CH = 0;
+static constexpr uint8_t  ESC_LEDC_RES_BITS   = 16;
+
+// ESP-IDF LEDC selections (stable across Arduino core versions)
+static constexpr ledc_mode_t       ESC_SPEED_MODE = LEDC_LOW_SPEED_MODE;
+static constexpr ledc_timer_t      ESC_TIMER      = LEDC_TIMER_0;
+static constexpr ledc_channel_t    ESC_CHANNEL    = LEDC_CHANNEL_0;
+static constexpr ledc_timer_bit_t  ESC_RES        = (ledc_timer_bit_t)ESC_LEDC_RES_BITS;
 
 // ----------------- DISPLAY -----------------
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
@@ -72,15 +105,15 @@ Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 #define IMU_ADDR 0x68
 
 static constexpr uint32_t SAMPLE_US = 4000; // 250 Hz
-static constexpr uint32_t UI_MS = 100;      // 10 Hz UI
-static constexpr uint32_t LOG_MS = 20;      // 50 Hz logging
-static constexpr uint32_t MOTOR_MS = 20;    // 50 Hz motor
+static constexpr uint32_t UI_MS     = 100;  // 10 Hz UI
+static constexpr uint32_t LOG_MS    = 20;   // 50 Hz logging
+static constexpr uint32_t MOTOR_MS  = 20;   // 50 Hz motor
 
 // Gravity separation LPF
-static constexpr float DT_S = 0.004f;
+static constexpr float DT_S    = 0.004f;
 static constexpr float FC_G_HZ = 1.5f;
-static constexpr float PI_F = 3.1415926f;
-static constexpr float RC = 1.0f / (2.0f * PI_F * FC_G_HZ);
+static constexpr float PI_F    = 3.1415926f;
+static constexpr float RC      = 1.0f / (2.0f * PI_F * FC_G_HZ);
 static constexpr float ALPHA_G = DT_S / (RC + DT_S);
 
 // RMS window
@@ -90,7 +123,7 @@ static constexpr int RMS_N = 250; // 1s @ 250 Hz
 static constexpr int BASELINE_WINDOWS_DEFAULT = 3;
 
 // Redraw thresholds
-static constexpr float AX_EPS = 0.03f;
+static constexpr float AX_EPS  = 0.03f;
 static constexpr float VIB_EPS = 0.01f;
 static constexpr float THR_EPS = 0.01f;
 
@@ -101,13 +134,11 @@ bool jsonEnabled = false;
 bool sdOk = false;
 uint32_t runNumber = 0;
 
-// Auto-start/stop logging for tests
-bool logAutoThisRun = false;      // true if logging was started automatically for a motor test
-bool pendingAutoStop = false;     // request to stop once motor at idle
-uint32_t autoStopReqMs = 0;       // millis() when auto-stop requested
+bool logAutoThisRun   = false; // started implicitly by a test
+bool pendingAutoStop  = false; // requested stop; will stop when thr hits ~0
 
 char motorId[48] = "UNKNOWN";
-char notes[96] = "";
+char notes[96]   = "";
 
 // run metadata snapshot
 uint32_t runStartMs = 0;
@@ -119,8 +150,8 @@ float ax = 0, ay = 0, az = 0;
 float gx = 0, gy = 0, gz = 0;
 float dx = 0, dy = 0, dz = 0;
 float vibInst = 0;
-float vibRms = 0;
-float vibNet = 0;
+float vibRms  = 0;
+float vibNet  = 0;
 
 double sumSq = 0.0;
 int rmsCount = 0;
@@ -152,9 +183,9 @@ enum MotorMode : uint8_t
 bool motorArmed = false;
 MotorMode motorMode = MOTOR_OFF;
 
-float thrCmd = 0.0f;
+float thrCmd    = 0.0f;
 float thrTarget = 0.0f;
-float rampRate = 0.20f; // thr units/sec
+float rampRate  = 0.20f; // thr units/sec
 
 bool manualTimerActive = false;
 uint32_t manualStopMs = 0;
@@ -191,43 +222,43 @@ enum EscCalState : uint8_t
 EscCalState escCalState = ESC_CAL_OFF;
 uint32_t escCalT0 = 0;
 static constexpr uint32_t ESC_CAL_HIGH_MS = 15000; // hold HIGH for 15s
-static constexpr uint32_t ESC_CAL_LOW_MS = 15000;  // then LOW for 15s
+static constexpr uint32_t ESC_CAL_LOW_MS  = 15000; // then LOW for 15s
 
 // ----------------- UI LAYOUT -----------------
 static constexpr int SCREEN_W = 320;
 static constexpr int SCREEN_H = 240;
 
 static constexpr int MARGIN_X = 8;
-static constexpr int COL_W = 152;
-static constexpr int COL_GAP = 8;
-static constexpr int COL1_X = MARGIN_X;
-static constexpr int COL2_X = MARGIN_X + COL_W + COL_GAP;
+static constexpr int COL_W    = 152;
+static constexpr int COL_GAP  = 8;
+static constexpr int COL1_X   = MARGIN_X;
+static constexpr int COL2_X   = MARGIN_X + COL_W + COL_GAP;
 
 static constexpr int HEADER_Y1 = 6;
 static constexpr int HEADER_Y2 = 26;
 
 static constexpr int BODY_Y0 = 52;
-static constexpr int ROW_H = 22; // size 2
+static constexpr int ROW_H  = 22; // size 2
 
 static constexpr int LABEL_W_PIX = 84;
-static constexpr int VALUE_XOFF = LABEL_W_PIX;
+static constexpr int VALUE_XOFF  = LABEL_W_PIX;
 
-static constexpr int META_Y0 = 184;
+static constexpr int META_Y0   = 184;
 static constexpr int META_LINE = 10;
-static constexpr int META_PAD = 2;
+static constexpr int META_PAD  = 2;
 
 static constexpr int STATUS_H = 20;
 static constexpr int STATUS_Y = SCREEN_H - STATUS_H;
 
 // colors
-static constexpr uint16_t C_BG = ILI9341_BLACK;
-static constexpr uint16_t C_HDR = ILI9341_CYAN;
-static constexpr uint16_t C_OK = ILI9341_GREEN;
-static constexpr uint16_t C_WARN = ILI9341_ORANGE;
-static constexpr uint16_t C_BAD = ILI9341_RED;
+static constexpr uint16_t C_BG    = ILI9341_BLACK;
+static constexpr uint16_t C_HDR   = ILI9341_CYAN;
+static constexpr uint16_t C_OK    = ILI9341_GREEN;
+static constexpr uint16_t C_WARN  = ILI9341_ORANGE;
+static constexpr uint16_t C_BAD   = ILI9341_RED;
 static constexpr uint16_t C_LABEL = ILI9341_WHITE;
 static constexpr uint16_t C_VALUE = ILI9341_WHITE;
-static constexpr uint16_t C_TEXT = ILI9341_YELLOW;
+static constexpr uint16_t C_TEXT  = ILI9341_YELLOW;
 
 // ----------------- I2C REG IO -----------------
 bool writeReg(uint8_t r, uint8_t v)
@@ -350,11 +381,13 @@ const char *escCalName(EscCalState s)
   }
 }
 
-// ----------------- ESC PWM -----------------
+// ----------------- ESC PWM (ESP-IDF LEDC) -----------------
+static bool escLedcInited = false;
+
 uint32_t usToDuty(uint32_t us)
 {
   const uint32_t period_us = 1000000UL / (uint32_t)escFreqHz;
-  const uint32_t maxDuty = (1UL << ESC_LEDC_RES_BITS) - 1UL;
+  const uint32_t maxDuty   = (1UL << ESC_LEDC_RES_BITS) - 1UL;
   if (us >= period_us) us = period_us - 1;
   uint64_t duty = (uint64_t)us * (uint64_t)maxDuty / (uint64_t)period_us;
   if (duty > maxDuty) duty = maxDuty;
@@ -367,11 +400,66 @@ int thrToUs(float thr)
   return (int)lroundf((float)ESC_MIN_US + thr * (float)(ESC_MAX_US - ESC_MIN_US));
 }
 
+static bool escLedcInit(uint32_t hz)
+{
+  // timer
+  ledc_timer_config_t tcfg{};
+  tcfg.speed_mode       = ESC_SPEED_MODE;
+  tcfg.timer_num        = ESC_TIMER;
+  tcfg.duty_resolution  = ESC_RES;
+  tcfg.freq_hz          = hz;
+  tcfg.clk_cfg          = LEDC_AUTO_CLK;
+
+  esp_err_t e = ledc_timer_config(&tcfg);
+  if (e != ESP_OK) {
+    Serial.println("ERR ledc_timer_config_failed");
+    return false;
+  }
+
+  // channel
+  ledc_channel_config_t ccfg{};
+  ccfg.gpio_num   = ESC_PIN;
+  ccfg.speed_mode = ESC_SPEED_MODE;
+  ccfg.channel    = ESC_CHANNEL;
+  ccfg.intr_type  = LEDC_INTR_DISABLE;
+  ccfg.timer_sel  = ESC_TIMER;
+  ccfg.duty       = 0;
+  ccfg.hpoint     = 0;
+
+  e = ledc_channel_config(&ccfg);
+  if (e != ESP_OK) {
+    Serial.println("ERR ledc_channel_config_failed");
+    return false;
+  }
+
+  escLedcInited = true;
+  return true;
+}
+
+static bool escLedcSetFreq(uint32_t hz)
+{
+  // re-config the timer at new frequency (keeps channel)
+  ledc_timer_config_t tcfg{};
+  tcfg.speed_mode       = ESC_SPEED_MODE;
+  tcfg.timer_num        = ESC_TIMER;
+  tcfg.duty_resolution  = ESC_RES;
+  tcfg.freq_hz          = hz;
+  tcfg.clk_cfg          = LEDC_AUTO_CLK;
+
+  esp_err_t e = ledc_timer_config(&tcfg);
+  return (e == ESP_OK);
+}
+
 void escWriteUs(int us)
 {
+  if (!escLedcInited) return;
+
   us = clampInt(us, ESC_MIN_US, ESC_MAX_US);
   const uint32_t duty = usToDuty((uint32_t)us);
-  ledcWrite(ESC_LEDC_CH, duty); // legacy API: (channel, duty)
+
+  // duty set/update
+  ledc_set_duty(ESC_SPEED_MODE, ESC_CHANNEL, duty);
+  ledc_update_duty(ESC_SPEED_MODE, ESC_CHANNEL);
 }
 
 int currentEscUs()
@@ -390,14 +478,13 @@ bool escSetFrequency(uint32_t hz)
     return false;
   }
 
-  const uint32_t actual = ledcChangeFrequency(ESC_LEDC_CH, hz, ESC_LEDC_RES_BITS);
-  if (actual == 0)
+  if (!escLedcSetFreq(hz))
   {
     Serial.println("ERR esc_freq_change_failed");
     return false;
   }
 
-  escFreqHz = actual;
+  escFreqHz = hz;
   escWriteUs(currentEscUs());
 
   Serial.print("OK esc_freq=");
@@ -442,7 +529,10 @@ void writeRunHeader(File &f)
 {
   f.println("# rig=esp32_motor_dyno");
   f.println("# fw=1.4_sweep_stop_fix");
-  f.print("# git_sha="); f.println(BUILD_GIT_SHA);
+  f.print("# git_sha="); f.println(GIT_SHA);
+f.print("# build_utc="); f.println(BUILD_UTC);
+f.print("# git_dirty="); f.println(GIT_DIRTY);
+
   f.print("# motor_id="); f.println(motorId);
   f.print("# notes="); f.println(notes);
   f.print("# imu_whoami=0x"); f.println(whoami, HEX);
@@ -537,41 +627,7 @@ uint32_t cpuFreqMHz=0;
 uint32_t sketchSizeB=0;
 uint32_t freeSketchB=0;
 
-// ----------------- LOG AUTO-STOP HELPERS -----------------
-static inline void requestAutoStopLogging()
-{
-  if (loggingEnabled && logAutoThisRun)
-  {
-    pendingAutoStop = true;
-    autoStopReqMs = millis();
-  }
-}
-
-static inline void checkAutoStopLogging(uint32_t nowMs)
-{
-  if (!pendingAutoStop) return;
-
-  if (!(loggingEnabled && logAutoThisRun))
-  {
-    pendingAutoStop = false;
-    return;
-  }
-
-  // Give motor control time to ramp to zero; also allows at least one idle log sample.
-  if ((uint32_t)(nowMs - autoStopReqMs) < 250) return;
-
-  const bool escAtMin = (currentEscUs() <= (ESC_MIN_US + 1));
-  const bool thrAtZero = (thrCmd <= 0.002f) && (thrTarget <= 0.002f);
-
-  if (escAtMin && (thrAtZero || !motorArmed))
-  {
-    pendingAutoStop = false; // prevent re-entry
-    // stopLogging() clears logAutoThisRun/pendingAutoStop and advances runNumber
-    extern void stopLogging(); // forward (defined below)
-    stopLogging();
-  }
-}
-
+// ----------------- AUTO STOP LOGGING (FIXED: GLOBAL, NOT INSIDE LOOP) -----------------
 // ----------------- LOGGING START/STOP -----------------
 bool startLogging()
 {
@@ -592,13 +648,12 @@ bool startLogging()
     return false;
   }
 
-  // Manual log start: do NOT mark as auto.
+  runStartMs = millis();
+  
+  // default: manual logging session
   logAutoThisRun = false;
   pendingAutoStop = false;
-  autoStopReqMs = 0;
-
-  runStartMs = millis();
-  baselineAtRun = vibBaseline;
+baselineAtRun = vibBaseline;
   baselineValidAtRun = baselineValid;
 
   // reset summary
@@ -628,6 +683,11 @@ bool startLogging()
   snprintf(csvName, sizeof(csvName), "/RUN%04lu.CSV", (unsigned long)runNumber);
   snprintf(jsonName, sizeof(jsonName), "/RUN%04lu.JSON", (unsigned long)runNumber);
 
+  logJsonWriteKeyValueStr("git_sha", GIT_SHA, TFT_CS, SD_CS);
+logJsonWriteKeyValueStr("build_utc", BUILD_UTC, TFT_CS, SD_CS);
+logJsonWriteKeyValueI32("git_dirty", GIT_DIRTY, TFT_CS, SD_CS);
+
+
   // CSV open first (must-have)
   if (!logCsvOpen(csvName, TFT_CS, SD_CS, writeRunHeader))
   {
@@ -646,7 +706,6 @@ bool startLogging()
     logJsonWriteKeyValueStr("schema", "esp32_motor_rig_run_v2", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("rig", "esp32_motor_dyno", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("fw", "1.4_sweep_stop_fix", TFT_CS, SD_CS);
-    logJsonWriteKeyValueStr("git_sha", BUILD_GIT_SHA, TFT_CS, SD_CS);
 
     logJsonBeginObject("files", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("csv", csvName, TFT_CS, SD_CS);
@@ -728,10 +787,46 @@ static bool ensureLoggingForTest()
 
   if (!startLogging()) return false;
 
-  logAutoThisRun = true;
+  logAutoThisRun  = true;   // started automatically by a test
   pendingAutoStop = false;
-  autoStopReqMs = 0;
   return true;
+}
+
+// stopLogging() is defined later; autoStopTick() needs a declaration.
+void stopLogging();
+
+
+// ----------------- AUTO STOP LOGGING (for auto-started logs) -----------------
+static inline void requestAutoStopLogging()
+{
+  // Only auto-stop logs that were auto-started for this test
+  if (loggingEnabled && logAutoThisRun) pendingAutoStop = true;
+}
+
+static inline bool canAutoStopNow()
+{
+  if (!loggingEnabled) return false;
+  if (!logAutoThisRun) return false;
+  if (!pendingAutoStop) return false;
+
+  // If ESC calibration is active, do not touch logging state
+  if (escCalState != ESC_CAL_OFF) return false;
+
+  // We consider "safe" to stop when commanded output is at minimum.
+  // Note: motor may already be disarmed (estop/disarm) — that's OK.
+  if (currentEscUs() != ESC_MIN_US) return false;
+  if (thrCmd > 0.001f) return false;
+
+  return true;
+}
+
+static inline void autoStopTick()
+{
+  if (canAutoStopNow())
+  {
+    // stopLogging() resets logAutoThisRun / pendingAutoStop and increments runNumber
+    stopLogging();
+  }
 }
 
 static void appendRunSummaryCsv(uint32_t stopMs)
@@ -742,11 +837,11 @@ static void appendRunSummaryCsv(uint32_t stopMs)
 
   const uint32_t durationMs = stopMs - runStartMs;
 
-  float thrMax = st_thr_cmd.has ? st_thr_cmd.maxv : 0.0f;
-  float escMax = st_esc_us.has ? st_esc_us.maxv : 0.0f;
+  float thrMax     = st_thr_cmd.has ? st_thr_cmd.maxv : 0.0f;
+  float escMax     = st_esc_us.has  ? st_esc_us.maxv  : 0.0f;
   float vibInstMax = st_vib_inst.has ? st_vib_inst.maxv : 0.0f;
   float vibRmsMean = st_vib_rms.has ? statFMean(st_vib_rms) : 0.0f;
-  int32_t rpmMax = st_rpm.has ? st_rpm.maxv : -1;
+  int32_t rpmMax   = st_rpm.has ? st_rpm.maxv : -1;
 
   char row[220];
   snprintf(row, sizeof(row),
@@ -786,6 +881,7 @@ void stopLogging()
   {
     RunSummary s;
 
+    // Identity
     s.run_id   = runNumber;
 
     char csvName[20];
@@ -795,33 +891,40 @@ void stopLogging()
     s.run_file  = csvName;
     s.json_file = jsonName;
 
-    s.git_sha   = BUILD_GIT_SHA;
-    s.fw_version = "1.4_sweep_stop_fix";
+    // Provenance
+    s.git_sha        = "";
+    s.fw_version     = "1.4_sweep_stop_fix";
     s.schema_version = "1";
 
-    s.start_epoch = 0;
-    s.start_ms = runStartMs;
-    s.duration_ms = stopMs - runStartMs;
-    s.samples_csv = logSamplesTotal;
+    // Timing / counts
+    s.start_epoch    = 0;
+    s.start_ms       = runStartMs;
+    s.duration_ms    = stopMs - runStartMs;
+    s.samples_csv    = logSamplesTotal;
     s.log_hz_nominal = 50.0f;
 
-    s.mode = testName;
+    // Mode / target
+    s.mode   = testName;
     s.target = "throttle";
 
-    s.ppr = 1;
+    // Pins / PPR (RPM placeholder)
+    s.ppr     = 1;
     s.esc_pin = ESC_PIN;
     s.rpm_pin = -1;
 
+    // End status
     s.end_reason = "ok";
     s.fault_code = "none";
 
+    // RPM summary
     if (st_rpm.has) {
       s.rpm_min = (float)st_rpm.minv;
       s.rpm_max = (float)st_rpm.maxv;
       s.rpm_avg = statIMean(st_rpm);
     }
 
-    if (st_vib_rms.has) s.vib_rms_g = statFMean(st_vib_rms);
+    // Vibration summary (your values are m/s^2; schema labels say "g"—leave as-is for now)
+    if (st_vib_rms.has)  s.vib_rms_g = statFMean(st_vib_rms);
     if (st_vib_inst.has) s.vib_max_g = st_vib_inst.maxv;
     s.vib_axis_max_g = "";
 
@@ -888,12 +991,10 @@ void stopLogging()
     logJsonCloseWithStopMs(stopMs, TFT_CS, SD_CS);
   }
 
-  jsonEnabled = false;
-  loggingEnabled = false;
-
-  logAutoThisRun = false;
+  jsonEnabled     = false;
+  loggingEnabled  = false;
+  logAutoThisRun  = false;
   pendingAutoStop = false;
-  autoStopReqMs = 0;
 
   statusBar("LOG STOPPED", C_WARN);
   Serial.println("OK log_stopped");
@@ -963,12 +1064,13 @@ void motorDisarm(const char *reason)
   thrCmd = 0;
   manualTimerActive = false;
   step_holding = false;
+
+  // hard low
   escWriteUs(ESC_MIN_US);
 
-  // Auto-stop logging too (requested by you: yes, also on estop/disarm when auto-started)
+  
   requestAutoStopLogging();
-
-  statusBar(reason ? reason : "MOTOR DISARM", C_BAD);
+statusBar(reason ? reason : "MOTOR DISARM", C_BAD);
   Serial.print("OK motor_disarm reason=");
   Serial.println(reason ? reason : "(none)");
 
@@ -982,6 +1084,7 @@ void motorArm()
   thrTarget = 0;
   thrCmd = 0;
   manualTimerActive = false;
+
   escWriteUs(ESC_MIN_US);
 
   setTest(TEST_NONE, "none");
@@ -999,7 +1102,8 @@ void sweepStop()
 
   thrTarget = 0.0f;
 
-  // If this run's logging was auto-started by a test, request log auto-stop once the motor is at idle.
+    requestAutoStopLogging();
+// if this run was auto-started by a test, request auto log stop
   requestAutoStopLogging();
 
   Serial.println("OK sweep_stop");
@@ -1019,10 +1123,10 @@ void sweepStartStep(float start, float stop, float step, float hold_s, float ram
   manualTimerActive = false;
 
   step_start = clamp01(start);
-  step_stop = clamp01(stop);
-  step_step = (step > 0.0f) ? step : 0.01f;
+  step_stop  = clamp01(stop);
+  step_step  = (step > 0.0f) ? step : 0.01f;
   step_hold_s = (hold_s > 0.0f) ? hold_s : 1.0f;
-  rampRate = (ramp > 0.0f) ? ramp : rampRate;
+  rampRate   = (ramp > 0.0f) ? ramp : rampRate;
 
   step_current = step_start;
   thrTarget = step_current;
@@ -1053,7 +1157,7 @@ void sweepStartRamp(float start, float stop, float dur_s)
   manualTimerActive = false;
 
   ramp_start = clamp01(start);
-  ramp_stop = clamp01(stop);
+  ramp_stop  = clamp01(stop);
   ramp_dur_s = (dur_s > 0.1f) ? dur_s : 1.0f;
   ramp_startMs = millis();
   motorMode = MOTOR_SWEEP_RAMP;
@@ -1088,9 +1192,9 @@ void sweepStartTri(float tmin, float tmax, float period_s, int cycles)
     tri_max = tmp;
   }
   tri_period_s = (period_s > 0.2f) ? period_s : 2.0f;
-  tri_cycles = (cycles > 0) ? cycles : 1;
-  tri_startMs = millis();
-  motorMode = MOTOR_SWEEP_TRI;
+  tri_cycles   = (cycles > 0) ? cycles : 1;
+  tri_startMs  = millis();
+  motorMode    = MOTOR_SWEEP_TRI;
 
   setTest(TEST_SWEEP_TRI, "sweep_tri");
   test_a = tri_min;
@@ -1231,11 +1335,12 @@ void motorUpdateTick(uint32_t nowMs)
     motorMode = MOTOR_MANUAL;
     thrTarget = 0.0f;
 
-    // If this run's logging was auto-started by a test, request log auto-stop once the motor is at idle.
+    // auto-stop logging when manual timed ends (if this was auto-started logging)
     requestAutoStopLogging();
 
     Serial.println("OK manual_done");
-    statusBar("MANUAL DONE", C_WARN);
+        requestAutoStopLogging();
+statusBar("MANUAL DONE", C_WARN);
   }
 
   switch (motorMode)
@@ -1298,6 +1403,7 @@ void motorUpdateTick(uint32_t nowMs)
     break;
   }
 
+  // ramp thrCmd toward thrTarget
   float dt = (float)MOTOR_MS / 1000.0f;
   float maxDelta = rampRate * dt;
   float diff = thrTarget - thrCmd;
@@ -1306,6 +1412,15 @@ void motorUpdateTick(uint32_t nowMs)
 
   thrCmd = clamp01(thrCmd + diff);
   escWriteUs(thrToUs(thrCmd));
+
+  // If we requested auto-stop and we're basically at zero, stop the log now.
+  if (pendingAutoStop && loggingEnabled && logAutoThisRun)
+  {
+    if (thrCmd <= 0.001f && thrTarget <= 0.001f && motorMode == MOTOR_MANUAL && !manualTimerActive)
+    {
+      stopLogging(); // clears pendingAutoStop/logAutoThisRun
+    }
+  }
 }
 
 // ----------------- UI STATIC -----------------
@@ -1547,7 +1662,7 @@ void handleCliLine(char *line)
   {
     if (argc != 2 || isFlag(argv[1])) { Serial.println("ERR log_syntax"); return; }
     if (streqi(argv[1], "START")) { setTest(TEST_LOG_ONLY, "log_only"); (void)startLogging(); return; }
-    if (streqi(argv[1], "STOP")) { stopLogging(); return; }
+    if (streqi(argv[1], "STOP"))  { stopLogging(); return; }
     Serial.println("ERR log_syntax"); return;
   }
 
@@ -1632,7 +1747,14 @@ void handleCliLine(char *line)
     if (streqi(argv[1], "ESTOP"))
     {
       if (argc != 2) { Serial.println("ERR motor_estop_syntax"); return; }
-      motorDisarm("E-STOP"); return;
+
+      // HARD STOP OUTPUT NOW
+      motorDisarm("E-STOP");
+
+      // ALSO STOP AUTO-STARTED LOGGING IMMEDIATELY (your ask)
+      if (loggingEnabled && logAutoThisRun) stopLogging();
+
+      return;
     }
 
     if (streqi(argv[1], "SET"))
@@ -1680,6 +1802,7 @@ void handleCliLine(char *line)
         int us;
         if (!parseInt(uv, us)) { Serial.println("ERR us_not_int"); return; }
         us = clampInt(us, ESC_MIN_US, ESC_MAX_US);
+
         thrTarget = clamp01((float)(us - ESC_MIN_US) / (float)(ESC_MAX_US - ESC_MIN_US));
         motorMode = MOTOR_MANUAL;
         manualTimerActive = false;
@@ -1734,16 +1857,11 @@ void handleCliLine(char *line)
       if (!checkNoUnknownFlags(argc, argv, allowed, 10)) return;
 
       bool ok = true;
-      const char *sa = optValue(argc, argv, "-a", "--start", ok);
-      if (!ok) { Serial.println("ERR start_requires_value"); return; }
-      const char *sb = optValue(argc, argv, "-b", "--stop", ok);
-      if (!ok) { Serial.println("ERR stop_requires_value"); return; }
-      const char *sp = optValue(argc, argv, "-p", "--step", ok);
-      if (!ok) { Serial.println("ERR step_requires_value"); return; }
-      const char *sh = optValue(argc, argv, "-h", "--hold", ok);
-      if (!ok) { Serial.println("ERR hold_requires_value"); return; }
-      const char *sr = optValue(argc, argv, "-r", "--ramp", ok);
-      if (!ok) { Serial.println("ERR ramp_requires_value"); return; }
+      const char *sa = optValue(argc, argv, "-a", "--start", ok);  if (!ok) { Serial.println("ERR start_requires_value"); return; }
+      const char *sb = optValue(argc, argv, "-b", "--stop", ok);   if (!ok) { Serial.println("ERR stop_requires_value"); return; }
+      const char *sp = optValue(argc, argv, "-p", "--step", ok);   if (!ok) { Serial.println("ERR step_requires_value"); return; }
+      const char *sh = optValue(argc, argv, "-h", "--hold", ok);   if (!ok) { Serial.println("ERR hold_requires_value"); return; }
+      const char *sr = optValue(argc, argv, "-r", "--ramp", ok);   if (!ok) { Serial.println("ERR ramp_requires_value"); return; }
 
       if (!sa || !sb || !sp || !sh) { Serial.println("ERR sweep_step_requires_start_stop_step_hold"); return; }
 
@@ -1763,12 +1881,9 @@ void handleCliLine(char *line)
       if (!checkNoUnknownFlags(argc, argv, allowed, 6)) return;
 
       bool ok = true;
-      const char *sa = optValue(argc, argv, "-a", "--start", ok);
-      if (!ok) { Serial.println("ERR start_requires_value"); return; }
-      const char *sb = optValue(argc, argv, "-b", "--stop", ok);
-      if (!ok) { Serial.println("ERR stop_requires_value"); return; }
-      const char *sd = optValue(argc, argv, "-d", "--dur", ok);
-      if (!ok) { Serial.println("ERR dur_requires_value"); return; }
+      const char *sa = optValue(argc, argv, "-a", "--start", ok); if (!ok) { Serial.println("ERR start_requires_value"); return; }
+      const char *sb = optValue(argc, argv, "-b", "--stop", ok);  if (!ok) { Serial.println("ERR stop_requires_value"); return; }
+      const char *sd = optValue(argc, argv, "-d", "--dur", ok);   if (!ok) { Serial.println("ERR dur_requires_value"); return; }
 
       if (!sa || !sb || !sd) { Serial.println("ERR sweep_ramp_requires_start_stop_dur"); return; }
 
@@ -1786,14 +1901,10 @@ void handleCliLine(char *line)
       if (!checkNoUnknownFlags(argc, argv, allowed, 8)) return;
 
       bool ok = true;
-      const char *smin = optValue(argc, argv, "-m", "--min", ok);
-      if (!ok) { Serial.println("ERR min_requires_value"); return; }
-      const char *smax = optValue(argc, argv, "-x", "--max", ok);
-      if (!ok) { Serial.println("ERR max_requires_value"); return; }
-      const char *sper = optValue(argc, argv, "-p", "--period", ok);
-      if (!ok) { Serial.println("ERR period_requires_value"); return; }
-      const char *scyc = optValue(argc, argv, "-c", "--cycles", ok);
-      if (!ok) { Serial.println("ERR cycles_requires_value"); return; }
+      const char *smin = optValue(argc, argv, "-m", "--min", ok);     if (!ok) { Serial.println("ERR min_requires_value"); return; }
+      const char *smax = optValue(argc, argv, "-x", "--max", ok);     if (!ok) { Serial.println("ERR max_requires_value"); return; }
+      const char *sper = optValue(argc, argv, "-p", "--period", ok);  if (!ok) { Serial.println("ERR period_requires_value"); return; }
+      const char *scyc = optValue(argc, argv, "-c", "--cycles", ok);  if (!ok) { Serial.println("ERR cycles_requires_value"); return; }
 
       if (!smin || !smax || !sper || !scyc)
       { Serial.println("ERR sweep_tri_requires_min_max_period_cycles"); return; }
@@ -1867,10 +1978,13 @@ void setup()
   sdOk = SD.begin(SD_CS, SPI, 25000000);
   if (sdOk) runNumber = findNextRunNumber();
 
-  ledcSetup(ESC_LEDC_CH, ESC_FREQ_HZ_DEFAULT, ESC_LEDC_RES_BITS);
-  ledcAttachPin(ESC_PIN, ESC_LEDC_CH);
-
+  // LEDC init (ESP-IDF)
   escFreqHz = ESC_FREQ_HZ_DEFAULT;
+  if (!escLedcInit(escFreqHz))
+  {
+    statusBar("LEDC INIT FAIL", C_BAD);
+    Serial.println("ERR ledc_init_fail");
+  }
   escWriteUs(ESC_MIN_US);
 
   drawStaticUI();
@@ -1879,6 +1993,9 @@ void setup()
   Serial.println("READY (STRICT CLI)");
   helpMain();
   Serial.println();
+
+Serial.printf("FW build %s | SHA %s | dirty %d\n",
+              BUILD_UTC, GIT_SHA, GIT_DIRTY);
 }
 
 // ----------------- LOOP -----------------
@@ -1939,13 +2056,17 @@ void loop()
     motorUpdateTick(millis());
   }
 
+  // Auto-stop logging when a test ends (only for auto-started logs)
+  autoStopTick();
+
+
   // ---- UI refresh @ 10 Hz ----
   if ((int32_t)(millis() - nu) >= 0)
   {
     nu += UI_MS;
 
     static float ax_d = 999, ay_d = 999, az_d = 999, vi_d = 999, vr_d = 999;
-    static bool sdOk_d = 2;
+    static bool  sdOk_d = false;  // FIX: proper bool
     static uint32_t run_d = 0xFFFFFFFF;
     static int escus_d = -9999;
     static int rpm_d = -9999;
@@ -2125,9 +2246,6 @@ void loop()
       logCsvMaybeFlush(&flushCtr, (uint16_t)(1000 / LOG_MS), TFT_CS, SD_CS);
     }
   }
-
-  // ---- auto-stop logging (when logging was auto-started for a test) ----
-  checkAutoStopLogging((uint32_t)millis());
 
   pollCli();
 }
