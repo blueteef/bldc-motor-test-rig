@@ -128,6 +128,10 @@ static constexpr float AX_EPS  = 0.03f;
 static constexpr float VIB_EPS = 0.01f;
 static constexpr float THR_EPS = 0.01f;
 
+// Shunt for power measurment constants
+static constexpr float INA226_SHUNT_OHMS = 0.00375f;
+
+
 // ----------------- STATE -----------------
 File logFile; // legacy bridge
 bool loggingEnabled = false;
@@ -1451,8 +1455,8 @@ void drawStaticUI()
 
   drawLabel2(COL2_X, BODY_Y0 + 0 * ROW_H, "SD:");
   drawLabel2(COL2_X, BODY_Y0 + 1 * ROW_H, "RUN:");
-  drawLabel2(COL2_X, BODY_Y0 + 2 * ROW_H, "MODE:");
-  drawLabel2(COL2_X, BODY_Y0 + 3 * ROW_H, "US:");
+  drawLabel2(COL2_X, BODY_Y0 + 2 * ROW_H, "(V):");
+  drawLabel2(COL2_X, BODY_Y0 + 3 * ROW_H, "(A):");
   drawLabel2(COL2_X, BODY_Y0 + 4 * ROW_H, "RPM:");
 
   tft.fillRect(0, META_Y0, SCREEN_W, (STATUS_Y - META_Y0), C_BG);
@@ -2091,11 +2095,9 @@ static uint32_t ns = micros();
     static float ax_d = 999, ay_d = 999, az_d = 999, vi_d = 999, vr_d = 999;
     static bool  sdOk_d = false;  // FIX: proper bool
     static uint32_t run_d = 0xFFFFFFFF;
-    static int escus_d = -9999;
-    static int rpm_d = -9999;
+static int rpm_d = -9999;
     static MotorMode mode_d = (MotorMode)255;
-    static float thr_d = 999;
-    static char motor_d[48] = {0};
+static char motor_d[48] = {0};
     static char notes_d[96] = {0};
     static char stat_d[160] = {0};
 
@@ -2167,15 +2169,47 @@ static uint32_t ns = micros();
                           (escCalState != ESC_CAL_OFF) ? C_WARN : (motorArmed ? C_OK : C_WARN));
     }
 
-    int esc_us = currentEscUs();
-    if (esc_us != escus_d || fabsf(thrCmd - thr_d) > THR_EPS)
-    {
-      escus_d = esc_us;
-      thr_d = thrCmd;
-      char ubuf[14];
-      snprintf(ubuf, sizeof(ubuf), "%d", esc_us);
-      drawValueText2Fixed(vx2, vy0 + 3 * ROW_H, ubuf, rightValueWChars, C_VALUE);
-    }
+    // int esc_us = currentEscUs();
+    // if (esc_us != escus_d || fabsf(thrCmd - thr_d) > THR_EPS)
+    // {
+    //   escus_d = esc_us;
+    //   thr_d = thrCmd;
+    //   char ubuf[14];
+    //   snprintf(ubuf, sizeof(ubuf), "%d", esc_us);
+    //   drawValueText2Fixed(vx2, vy0 + 3 * ROW_H, ubuf, rightValueWChars, C_VALUE);
+    // }
+// ---- Power UI (VIN / IIN) ----
+static float vin_d = -9999.0f;
+static float iin_d = -9999.0f;
+
+const auto& ss = rigSensorsGet();
+const bool powerMissing = (ss.flags & RIG_SENS_POWER_MISSING);
+
+float vin = powerMissing ? NAN : ss.vin_v;
+float iin = powerMissing ? NAN : ss.iin_a;
+
+const float VIN_EPS = 0.02f;
+const float IIN_EPS = 0.02f;
+
+if ((isnan(vin) != isnan(vin_d)) || (!isnan(vin) && fabsf(vin - vin_d) > VIN_EPS))
+{
+  vin_d = vin;
+  char buf[14];
+  if (isnan(vin)) snprintf(buf, sizeof(buf), "N/A");
+  else snprintf(buf, sizeof(buf), "%.2f", vin);
+
+  drawValueText2Fixed(vx2, vy0 + 2 * ROW_H, buf, rightValueWChars, C_VALUE);
+}
+
+if ((isnan(iin) != isnan(iin_d)) || (!isnan(iin) && fabsf(iin - iin_d) > IIN_EPS))
+{
+  iin_d = iin;
+  char buf[14];
+  if (isnan(iin)) snprintf(buf, sizeof(buf), "N/A");
+  else snprintf(buf, sizeof(buf), "%.2f", iin);
+
+  drawValueText2Fixed(vx2, vy0 + 3 * ROW_H, buf, rightValueWChars, C_VALUE);
+}
 
     if (rpmValue != rpm_d)
     {
@@ -2185,8 +2219,7 @@ static uint32_t ns = micros();
       else snprintf(rbuf2, sizeof(rbuf2), "%ld", (long)rpmValue);
       drawValueText2Fixed(vx2, vy0 + 4 * ROW_H, rbuf2, rightValueWChars, C_VALUE);
     }
-
-    if (strcmp(motorId, motor_d) != 0)
+if (strcmp(motorId, motor_d) != 0)
     {
       strncpy(motor_d, motorId, sizeof(motor_d) - 1);
       motor_d[sizeof(motor_d) - 1] = '\0';
