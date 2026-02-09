@@ -67,6 +67,7 @@ void __attribute__((weak)) logJsonWriteColumns(const char* const* columns, size_
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 #include <math.h>
+#include "app/rig_sensors.h"
 
 // ----------------- PINOUT -----------------
 #define TFT_CS 5
@@ -1950,14 +1951,19 @@ void setup()
 {
   Serial.begin(115200);
 
-  pinMode(TFT_CS, OUTPUT);
+  
+  rigSensorsBegin();
+pinMode(TFT_CS, OUTPUT);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
   pinMode(TOUCH_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
   digitalWrite(TOUCH_CS, HIGH);
 
-  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, TFT_CS);
+  // Share one SPI bus between TFT + SD. Do NOT bind the bus "SS" to a device CS.
+  // Keeping SS unspecified avoids edge cases where the default SS pin is driven
+  // as part of SPI transactions.
+  SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI);
 
   tft.begin();
   tft.setRotation(3);
@@ -1975,7 +1981,15 @@ void setup()
   writeReg(0x1C, 0x10);
   writeReg(0x1B, 0x08);
 
+  // Ensure all SPI device CS lines are deasserted before SD init.
+  digitalWrite(TFT_CS, HIGH);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(SD_CS, HIGH);
+
+  // SD init can be finicky depending on wiring/card quality; try a few safe clocks.
   sdOk = SD.begin(SD_CS, SPI, 25000000);
+  if (!sdOk) sdOk = SD.begin(SD_CS, SPI, 10000000);
+  if (!sdOk) sdOk = SD.begin(SD_CS, SPI,  4000000);
   if (sdOk) runNumber = findNextRunNumber();
 
   // LEDC init (ESP-IDF)
@@ -2001,7 +2015,16 @@ Serial.printf("FW build %s | SHA %s | dirty %d\n",
 // ----------------- LOOP -----------------
 void loop()
 {
-  static uint32_t ns = micros();
+  
+  rigSensorsUpdate();
+  // Bridge new sensor snapshot into legacy UI/log variables.
+  // rpmValue is consumed widely for UI + stats; keep -1 for "N/A".
+  {
+    const auto& ss = rigSensorsGet();
+    if (ss.flags & RIG_SENS_TACH_MISSING) rpmValue = -1;
+    else rpmValue = (int32_t)lroundf(ss.rpm);
+  }
+static uint32_t ns = micros();
   static uint32_t nu = millis();
   static uint32_t nl = millis();
   static uint32_t nm = millis();
