@@ -33,35 +33,6 @@
 #include "bldc_rig/logging/run_summary.h"
 #include "bldc_rig/logging/log_run_summary.h"
 
-// -----------------------------------------------------------------------------
-// Linker-safety shim
-//
-// If PlatformIO's build config ever stops compiling/linking src/log_json.cpp
-// (e.g., src_filter/lib layout changes), you'll see an undefined reference to
-// `logJsonWriteColumns(...)` at link time.
-//
-// This weak fallback keeps the build green and still emits a minimal "columns"
-// array using the public logJsonFile() accessor.
-// -----------------------------------------------------------------------------
-void __attribute__((weak)) logJsonWriteColumns(const char* const* columns, size_t count, int tft_cs, int sd_cs)
-{
-  (void)tft_cs;
-  (void)sd_cs;
-  if (!logJsonIsOpen()) return;
-  fs::File f = logJsonFile();
-  if (!f) return;
-
-  f.print("\"columns\":[");
-  for (size_t i = 0; i < count; i++)
-  {
-    if (i) f.print(',');
-    f.print('"');
-    f.print(columns && columns[i] ? columns[i] : "");
-    f.print('"');
-  }
-  f.println("],");
-  f.flush();
-}
 #include "bldc_rig/core/version.h"
 
 #include <Adafruit_GFX.h>
@@ -533,7 +504,7 @@ uint32_t findNextRunNumber()
 void writeRunHeader(File &f)
 {
   f.println("# rig=esp32_motor_dyno");
-  f.println("# fw=1.4_sweep_stop_fix");
+  f.print("# fw="); f.println(FW_VERSION);
   f.print("# git_sha="); f.println(GIT_SHA);
 f.print("# build_utc="); f.println(BUILD_UTC);
 f.print("# git_dirty="); f.println(GIT_DIRTY);
@@ -551,7 +522,7 @@ f.print("# git_dirty="); f.println(GIT_DIRTY);
   f.print("# start_ms="); f.println(runStartMs);
   f.print("# baseline_valid="); f.println(baselineValidAtRun ? "true" : "false");
   f.print("# baseline_vibrms="); f.println(baselineAtRun, 6);
-  f.println("timestamp_ms,ax_mps2,ay_mps2,az_mps2,mag_mps2,vib_inst_mps2,vib_rms_mps2,vib_net_mps2,thr_cmd,esc_us,rpm");
+  f.println("timestamp_ms,ax_mps2,ay_mps2,az_mps2,mag_mps2,vib_inst_mps2,vib_rms_mps2,vib_net_mps2,thr_cmd,esc_us,rpm,vin_v,iin_a,pin_w,energy_wh");
   f.flush();
 }
 
@@ -590,6 +561,8 @@ static inline float statFMean(const StatF& s){ return s.n ? (float)(s.sum/(doubl
 static inline float statIMean(const StatI& s){ return s.n ? (float)((double)s.sum/(double)s.n) : 0.0f; }
 
 StatF st_vib_inst, st_vib_rms, st_vib_net, st_thr_cmd, st_esc_us;
+StatF st_vin, st_iin, st_pin;
+float energyAtStart = 0.0f;
 StatI st_rpm;
 uint32_t logSamplesTotal=0;
 uint32_t logSamplesRpmValid=0;
@@ -667,6 +640,10 @@ baselineAtRun = vibBaseline;
   statFReset(st_vib_net);
   statFReset(st_thr_cmd);
   statFReset(st_esc_us);
+  statFReset(st_vin);
+  statFReset(st_iin);
+  statFReset(st_pin);
+  energyAtStart = rigSensorsGet().energy_wh;
   statIReset(st_rpm);
   logSamplesTotal = 0;
   logSamplesRpmValid = 0;
@@ -688,11 +665,6 @@ baselineAtRun = vibBaseline;
   snprintf(csvName, sizeof(csvName), "/RUN%04lu.CSV", (unsigned long)runNumber);
   snprintf(jsonName, sizeof(jsonName), "/RUN%04lu.JSON", (unsigned long)runNumber);
 
-  logJsonWriteKeyValueStr("git_sha", GIT_SHA, TFT_CS, SD_CS);
-logJsonWriteKeyValueStr("build_utc", BUILD_UTC, TFT_CS, SD_CS);
-logJsonWriteKeyValueI32("git_dirty", GIT_DIRTY, TFT_CS, SD_CS);
-
-
   // CSV open first (must-have)
   if (!logCsvOpen(csvName, TFT_CS, SD_CS, writeRunHeader))
   {
@@ -711,6 +683,9 @@ logJsonWriteKeyValueI32("git_dirty", GIT_DIRTY, TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("schema", "esp32_motor_rig_run_v2", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("rig", "esp32_motor_dyno", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("fw", FW_VERSION, TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("git_sha", GIT_SHA, TFT_CS, SD_CS);
+    logJsonWriteKeyValueStr("build_utc", BUILD_UTC, TFT_CS, SD_CS);
+    logJsonWriteKeyValueI32("git_dirty", GIT_DIRTY, TFT_CS, SD_CS);
 
     logJsonBeginObject("files", TFT_CS, SD_CS);
     logJsonWriteKeyValueStr("csv", csvName, TFT_CS, SD_CS);
@@ -761,7 +736,8 @@ logJsonWriteKeyValueI32("git_dirty", GIT_DIRTY, TFT_CS, SD_CS);
       "vib_net_mps2",
       "thr_cmd",
       "esc_us",
-      "rpm"
+      "rpm",
+      "vin_v","iin_a","pin_w","energy_wh"
     };
     logJsonWriteColumns(cols, sizeof(cols)/sizeof(cols[0]), TFT_CS, SD_CS);
   }
@@ -838,7 +814,7 @@ static void appendRunSummaryCsv(uint32_t stopMs)
 {
   const char* summaryFile = "/RUN_SUMMARY_SHORT.CSV";
   const char* header =
-    "run,start_ms,stop_ms,duration_ms,test,thr_cmd_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max";
+    "run,start_ms,stop_ms,duration_ms,test,thr_cmd_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max,vin_max,iin_max,pwr_max,energy_wh";
 
   const uint32_t durationMs = stopMs - runStartMs;
 
@@ -847,10 +823,14 @@ static void appendRunSummaryCsv(uint32_t stopMs)
   float vibInstMax = st_vib_inst.has ? st_vib_inst.maxv : 0.0f;
   float vibRmsMean = st_vib_rms.has ? statFMean(st_vib_rms) : 0.0f;
   int32_t rpmMax   = st_rpm.has ? st_rpm.maxv : -1;
+  float vinMax     = st_vin.has ? st_vin.maxv : 0.0f;
+  float iinMax     = st_iin.has ? st_iin.maxv : 0.0f;
+  float pwrMax     = st_pin.has ? st_pin.maxv : 0.0f;
+  float eRun       = rigSensorsGet().energy_wh - energyAtStart;
 
-  char row[220];
+  char row[300];
   snprintf(row, sizeof(row),
-           "%lu,%lu,%lu,%lu,%s,%.6f,%.0f,%.6f,%.6f,%ld",
+           "%lu,%lu,%lu,%lu,%s,%.6f,%.0f,%.6f,%.6f,%ld,%.3f,%.3f,%.2f,%.4f",
            (unsigned long)runNumber,
            (unsigned long)runStartMs,
            (unsigned long)stopMs,
@@ -860,7 +840,8 @@ static void appendRunSummaryCsv(uint32_t stopMs)
            escMax,
            vibInstMax,
            vibRmsMean,
-           (long)rpmMax);
+           (long)rpmMax,
+           vinMax, iinMax, pwrMax, eRun);
 
   (void)runSummaryAppendRow(summaryFile, TFT_CS, SD_CS, row, true, header);
 }
@@ -897,8 +878,8 @@ void stopLogging()
     s.json_file = jsonName;
 
     // Provenance
-    s.git_sha        = "";
-    s.fw_version     = "1.4_sweep_stop_fix";
+    s.git_sha        = GIT_SHA;
+    s.fw_version     = FW_VERSION;
     s.schema_version = "1";
 
     // Timing / counts
@@ -928,6 +909,12 @@ void stopLogging()
       s.rpm_avg = statIMean(st_rpm);
     }
 
+    // Power summary
+    if (st_vin.has) { s.vbus_min_v = st_vin.minv; s.vbus_max_v = st_vin.maxv; }
+    if (st_iin.has) { s.ibus_min_a = st_iin.minv; s.ibus_max_a = st_iin.maxv; }
+    if (st_pin.has) { s.pwr_max_w = st_pin.maxv; }
+    s.energy_wh = rigSensorsGet().energy_wh - energyAtStart;
+
     // Vibration summary (your values are m/s^2; schema labels say "g"—leave as-is for now)
     if (st_vib_rms.has)  s.vib_rms_g = statFMean(st_vib_rms);
     if (st_vib_inst.has) s.vib_max_g = st_vib_inst.maxv;
@@ -935,7 +922,7 @@ void stopLogging()
 
     s.notes = notes;
 
-    (void)RunSummaryLog::append(SD, "/RUN_SUMMARY.CSV", s);
+    (void)RunSummaryLog::append(SD, "/RUN_SUMMARY.CSV", s, TFT_CS, SD_CS);
   }
 
   // JSON summary + stop_ms + close
@@ -990,6 +977,24 @@ void stopLogging()
       logJsonWriteKeyValueI32("rpm_min", st_rpm.minv, TFT_CS, SD_CS);
       logJsonWriteKeyValueI32("rpm_max", st_rpm.maxv, TFT_CS, SD_CS);
       logJsonWriteKeyValueF("rpm_mean", statIMean(st_rpm), 2, TFT_CS, SD_CS);
+    }
+    if (st_vin.has) {
+      logJsonWriteKeyValueF("vin_min", st_vin.minv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vin_max", st_vin.maxv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("vin_mean", statFMean(st_vin), 3, TFT_CS, SD_CS);
+    }
+    if (st_iin.has) {
+      logJsonWriteKeyValueF("iin_min", st_iin.minv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("iin_max", st_iin.maxv, 3, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("iin_mean", statFMean(st_iin), 3, TFT_CS, SD_CS);
+    }
+    if (st_pin.has) {
+      logJsonWriteKeyValueF("pin_max", st_pin.maxv, 2, TFT_CS, SD_CS);
+      logJsonWriteKeyValueF("pin_mean", statFMean(st_pin), 2, TFT_CS, SD_CS);
+    }
+    {
+      float eRun = rigSensorsGet().energy_wh - energyAtStart;
+      logJsonWriteKeyValueF("energy_wh", eRun, 4, TFT_CS, SD_CS);
     }
 
     logJsonEndObject(true, TFT_CS, SD_CS);
@@ -1108,8 +1113,6 @@ void sweepStop()
   thrTarget = 0.0f;
 
     requestAutoStopLogging();
-// if this run was auto-started by a test, request auto log stop
-  requestAutoStopLogging();
 
   Serial.println("OK sweep_stop");
   statusBar("SWEEP STOP", C_WARN);
@@ -1344,8 +1347,7 @@ void motorUpdateTick(uint32_t nowMs)
     requestAutoStopLogging();
 
     Serial.println("OK manual_done");
-        requestAutoStopLogging();
-statusBar("MANUAL DONE", C_WARN);
+    statusBar("MANUAL DONE", C_WARN);
   }
 
   switch (motorMode)
@@ -1955,9 +1957,7 @@ void setup()
 {
   Serial.begin(115200);
 
-  
-  rigSensorsBegin();
-pinMode(TFT_CS, OUTPUT);
+  pinMode(TFT_CS, OUTPUT);
   pinMode(SD_CS, OUTPUT);
   digitalWrite(TFT_CS, HIGH);
   pinMode(TOUCH_CS, OUTPUT);
@@ -1976,6 +1976,9 @@ pinMode(TFT_CS, OUTPUT);
 
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(100000);
+
+  // Init INA226 + tach AFTER I2C bus is configured
+  rigSensorsBegin();
 
   uint8_t w = 0;
   if (readRegs(0x75, &w, 1)) whoami = w;
@@ -2261,6 +2264,14 @@ if (strcmp(motorId, motor_d) != 0)
       float mag = sqrtf(ax * ax + ay * ay + az * az);
       int esc_us = currentEscUs();
 
+      // Power snapshot for this log tick
+      const auto& pwr = rigSensorsGet();
+      const bool pwrOk = !(pwr.flags & RIG_SENS_POWER_MISSING);
+      float vin = pwrOk ? pwr.vin_v : 0.0f;
+      float iin = pwrOk ? pwr.iin_a : 0.0f;
+      float pin = pwrOk ? pwr.pin_w : 0.0f;
+      float ewh = pwrOk ? pwr.energy_wh : 0.0f;
+
       // live stats
       logSamplesTotal++;
       statFUpdate(st_vib_inst, vibInst);
@@ -2268,6 +2279,11 @@ if (strcmp(motorId, motor_d) != 0)
       statFUpdate(st_vib_net, vibNet);
       statFUpdate(st_thr_cmd, thrCmd);
       statFUpdate(st_esc_us, (float)esc_us);
+      if (pwrOk) {
+        statFUpdate(st_vin, vin);
+        statFUpdate(st_iin, iin);
+        statFUpdate(st_pin, pin);
+      }
 
       // heap min tracking
       uint32_t hm = ESP.getMinFreeHeap();
@@ -2283,9 +2299,9 @@ if (strcmp(motorId, motor_d) != 0)
         if (rpmPeakVal < 0 || rpmValue > rpmPeakVal) { rpmPeakVal = rpmValue; rpmPeakMs = tms; }
       }
 
-      char line[280];
+      char line[340];
       int n = snprintf(line, sizeof(line),
-                       "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%ld\n",
+                       "%lu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%d,%ld,%.3f,%.3f,%.3f,%.4f\n",
                        (unsigned long)millis(),
                        ax, ay, az,
                        mag,
@@ -2294,7 +2310,8 @@ if (strcmp(motorId, motor_d) != 0)
                        vibNet,
                        thrCmd,
                        esc_us,
-                       (long)rpmValue);
+                       (long)rpmValue,
+                       vin, iin, pin, ewh);
 
       logCsvWriteBytes((const uint8_t*)line, (size_t)n, TFT_CS, SD_CS);
 

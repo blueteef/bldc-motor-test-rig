@@ -69,10 +69,10 @@ struct RunSummary {
 
 namespace RunSummaryLog {
   // Create file + write header if missing/empty
-  bool ensureFileWithHeader(fs::FS &fs, const char* path);
+  bool ensureFileWithHeader(fs::FS &fs, const char* path, int tftCsPin = -1, int sdCsPin = -1);
 
   // Append one row
-  bool append(fs::FS &fs, const char* path, const RunSummary &s);
+  bool append(fs::FS &fs, const char* path, const RunSummary &s, int tftCsPin = -1, int sdCsPin = -1);
 
   // The header (canonical)
   const char* header();

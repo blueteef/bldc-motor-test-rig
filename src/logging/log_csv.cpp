@@ -8,7 +8,7 @@ static inline void spiSelectSd(int tftCsPin, int sdCsPin){
 }
 static inline void spiDeselectSd(int tftCsPin, int sdCsPin){
   digitalWrite(sdCsPin, HIGH);
-  digitalWrite(tftCsPin, LOW);
+  // Leave both deselected — Adafruit library handles its own TFT CS
 }
 
 bool logCsvOpen(const char* path, int tftCsPin, int sdCsPin, LogCsvHeaderWriter headerWriter){

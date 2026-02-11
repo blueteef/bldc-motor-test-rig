@@ -2,6 +2,18 @@
 #include "bldc_rig/logging/log_run_summary.h"
 #include <math.h>
 
+// SPI CS pins — set by caller via init or passed through
+static int gTftCs = -1;
+static int gSdCs  = -1;
+
+static inline void spiSelectSd() {
+  if (gTftCs >= 0) digitalWrite(gTftCs, HIGH);
+  if (gSdCs >= 0)  digitalWrite(gSdCs, LOW);
+}
+static inline void spiDeselectSd() {
+  if (gSdCs >= 0) digitalWrite(gSdCs, HIGH);
+}
+
 // --- Helpers ---
 static inline bool is_nan(float v) { return isnan(v); }
 
@@ -45,37 +57,51 @@ const char* header() {
     "notes";
 }
 
-bool ensureFileWithHeader(fs::FS &fs, const char* path) {
+bool ensureFileWithHeader(fs::FS &fs, const char* path, int tftCsPin, int sdCsPin) {
+  gTftCs = tftCsPin;
+  gSdCs  = sdCsPin;
+
   // If missing -> create and write header
-  if (!fs.exists(path)) {
+  spiSelectSd();
+  bool exists = fs.exists(path);
+  spiDeselectSd();
+
+  if (!exists) {
+    spiSelectSd();
     File f = fs.open(path, FILE_WRITE);
-    if (!f) return false;
+    if (!f) { spiDeselectSd(); return false; }
     f.println(header());
     f.close();
+    spiDeselectSd();
     return true;
   }
 
   // If exists but empty -> write header
+  spiSelectSd();
   File f = fs.open(path, FILE_READ);
-  if (!f) return false;
+  if (!f) { spiDeselectSd(); return false; }
   size_t sz = f.size();
   f.close();
+  spiDeselectSd();
 
   if (sz == 0) {
+    spiSelectSd();
     File fw = fs.open(path, FILE_WRITE);
-    if (!fw) return false;
+    if (!fw) { spiDeselectSd(); return false; }
     fw.println(header());
     fw.close();
+    spiDeselectSd();
   }
 
   return true;
 }
 
-bool append(fs::FS &fs, const char* path, const RunSummary &s) {
-  if (!ensureFileWithHeader(fs, path)) return false;
+bool append(fs::FS &fs, const char* path, const RunSummary &s, int tftCsPin, int sdCsPin) {
+  if (!ensureFileWithHeader(fs, path, tftCsPin, sdCsPin)) return false;
 
+  spiSelectSd();
   File f = fs.open(path, FILE_APPEND);
-  if (!f) return false;
+  if (!f) { spiDeselectSd(); return false; }
 
   // Keep order EXACTLY as header.
   f.print(s.run_id); f.print(',');
@@ -133,6 +159,7 @@ bool append(fs::FS &fs, const char* path, const RunSummary &s) {
   f.println(csvEscape(s.notes));
 
   f.close();
+  spiDeselectSd();
   return true;
 }
 

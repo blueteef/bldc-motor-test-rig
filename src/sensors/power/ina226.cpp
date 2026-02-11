@@ -16,12 +16,9 @@ bool Ina226::begin(uint8_t addr, float shunt_ohms, int sda, int scl, uint32_t i2
   i2c_addr = addr;
   r_shunt = (shunt_ohms > 0.0f) ? shunt_ohms : 0.00375f;
 
-  if (sda >= 0 && scl >= 0) {
-    Wire.begin(sda, scl);
-  } else {
-    Wire.begin();
-  }
-  Wire.setClock(i2c_hz);
+  // NOTE: Wire.begin() is NOT called here — the caller owns I2C bus init.
+  // This avoids double-init problems on ESP32 Arduino core v3+.
+  (void)sda; (void)scl; (void)i2c_hz;
 
   // Basic presence check: read config
   uint16_t cfg = 0;

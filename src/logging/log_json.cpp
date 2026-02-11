@@ -11,8 +11,17 @@ struct JsonCtx {
 static JsonCtx gStack[8];
 static int gDepth = 0;
 
-static inline void spiSelect(int pin)   { if (pin >= 0) digitalWrite(pin, LOW); }
-static inline void spiDeselect(int pin) { if (pin >= 0) digitalWrite(pin, HIGH); }
+static int gTftCs = -1;
+static int gSdCs  = -1;
+
+static inline void spiSelectSd(int tftCsPin, int sdCsPin) {
+  if (tftCsPin >= 0) digitalWrite(tftCsPin, HIGH);
+  if (sdCsPin >= 0)  digitalWrite(sdCsPin, LOW);
+}
+static inline void spiDeselectSd(int tftCsPin, int sdCsPin) {
+  if (sdCsPin >= 0)  digitalWrite(sdCsPin, HIGH);
+  // Leave both deselected — Adafruit library handles its own TFT CS
+}
 
 static inline void ctxPush()
 {
@@ -112,12 +121,15 @@ static inline void writeKeyPrefix(const char* key)
 
 bool logJsonOpen(const char* path, int tftCsPin, int sdCsPin)
 {
-  spiSelect(sdCsPin);
+  gTftCs = tftCsPin;
+  gSdCs  = sdCsPin;
+
+  spiSelectSd(tftCsPin, sdCsPin);
   gJson = SD.open(path, FILE_WRITE);
 
   if (!gJson)
   {
-    spiDeselect(sdCsPin);
+    spiDeselectSd(tftCsPin, sdCsPin);
     return false;
   }
 
@@ -127,14 +139,14 @@ bool logJsonOpen(const char* path, int tftCsPin, int sdCsPin)
 
   gJson.print("{\n");
   gJson.flush();
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
   return true;
 }
 
 void logJsonClose(int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   // Close any unclosed objects defensively
   while (gDepth > 1)
@@ -143,13 +155,13 @@ void logJsonClose(int tftCsPin, int sdCsPin)
     ctxPop();
   }
 
-trimTrailingCommaBeforeClose(gJson);
-gJson.print("\n}\n");
+  trimTrailingCommaBeforeClose(gJson);
+  gJson.print("\n}\n");
   gJson.flush();
   gJson.close();
 
   gDepth = 0;
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 bool logJsonIsOpen() { return (bool)gJson; }
@@ -158,7 +170,7 @@ fs::File logJsonFile() { return gJson; }
 void logJsonBeginObject(const char* nameOrNull, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   if (nameOrNull && nameOrNull[0])
   {
@@ -174,80 +186,80 @@ void logJsonBeginObject(const char* nameOrNull, int tftCsPin, int sdCsPin)
   gJson.print("{\n");
   ctxPush();
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonEndObject(bool /*trailingComma*/, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   // End current object
   if (gDepth > 1) ctxPop();
   gJson.print("\n}");
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonWriteKeyValueStr(const char* key, const char* value, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
   writeEscaped(value ? value : "");
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonWriteKeyValueU32(const char* key, uint32_t value, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
   gJson.print(value);
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonWriteKeyValueI32(const char* key, int32_t value, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
   gJson.print(value);
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonWriteKeyValueF(const char* key, float value, int decimals, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
   gJson.print(value, decimals);
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonWriteKeyValueBool(const char* key, bool value, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
   gJson.print(value ? "true" : "false");
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
-void logJsonWriteColumns(const char* cols[], size_t n, int tftCsPin, int sdCsPin)
+void logJsonWriteColumns(const char* const* cols, size_t n, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix("columns");
   gJson.print("[");
@@ -258,13 +270,13 @@ void logJsonWriteColumns(const char* cols[], size_t n, int tftCsPin, int sdCsPin
   }
   gJson.print("]");
 
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
 
 void logJsonCloseWithStopMs(uint32_t stopMs, int tftCsPin, int sdCsPin)
 {
   if (!gJson) return;
-  spiSelect(sdCsPin);
+  spiSelectSd(tftCsPin, sdCsPin);
 
   // Write stop_ms at root level
   writeKeyPrefix("stop_ms");
@@ -277,11 +289,11 @@ void logJsonCloseWithStopMs(uint32_t stopMs, int tftCsPin, int sdCsPin)
     ctxPop();
   }
 
-trimTrailingCommaBeforeClose(gJson);
-gJson.print("\n}\n");
+  trimTrailingCommaBeforeClose(gJson);
+  gJson.print("\n}\n");
   gJson.flush();
   gJson.close();
 
   gDepth = 0;
-  spiDeselect(sdCsPin);
+  spiDeselectSd(tftCsPin, sdCsPin);
 }
