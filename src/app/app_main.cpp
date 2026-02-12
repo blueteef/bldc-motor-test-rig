@@ -37,6 +37,9 @@
 
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
+#include <RTClib.h>
+#include <WiFi.h>
+#include <time.h>
 #include <math.h>
 #include "app/rig_sensors.h"
 
@@ -74,7 +77,7 @@ static constexpr ledc_timer_bit_t  ESC_RES        = (ledc_timer_bit_t)ESC_LEDC_R
 Adafruit_ILI9341 tft(TFT_CS, TFT_DC, TFT_RST);
 
 // ----------------- IMU -----------------
-#define IMU_ADDR 0x68
+#define IMU_ADDR 0x69
 
 static constexpr uint32_t SAMPLE_US = 4000; // 250 Hz
 static constexpr uint32_t UI_MS     = 100;  // 10 Hz UI
@@ -133,6 +136,88 @@ double sumSq = 0.0;
 int rmsCount = 0;
 volatile bool vibRmsUpdated = false;
 uint8_t whoami = 0;
+
+// ----------------- RTC -----------------
+RTC_PCF8523 rtc;
+bool rtcOk = false;
+bool rtcSynced = false;           // true after successful NTP or manual set
+char runUtcStr[28] = "";          // "2024-01-15T14:30:00Z" — captured once per run
+char displayTime[20] = "";        // "MM-DD HH:MM:SS" for TFT, updated at 1Hz
+uint32_t runStartEpoch = 0;       // Unix epoch captured at run start
+
+bool ntpSync()
+{
+  const char* ssid = WIFI_SSID;
+  const char* pass = WIFI_PASS;
+  if (!ssid || ssid[0] == '\0') {
+    Serial.println("WARN ntp_no_ssid");
+    return false;
+  }
+
+  Serial.print("NTP connecting WiFi SSID=");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, pass);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - t0) < 10000) {
+    delay(250);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WARN wifi_connect_fail");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+  Serial.print("OK wifi_connected ip=");
+  Serial.println(WiFi.localIP());
+
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+
+  struct tm ti;
+  bool gotTime = false;
+  t0 = millis();
+  while ((millis() - t0) < 10000) {
+    if (getLocalTime(&ti, 100)) { gotTime = true; break; }
+    delay(250);
+  }
+
+  if (!gotTime) {
+    Serial.println("WARN ntp_timeout");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    return false;
+  }
+
+  // Adjust RTC from NTP time
+  if (rtcOk) {
+    rtc.adjust(DateTime(
+      ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+      ti.tm_hour, ti.tm_min, ti.tm_sec));
+    rtcSynced = true;
+    Serial.printf("OK ntp_sync %04d-%02d-%02dT%02d:%02d:%02dZ\n",
+                  ti.tm_year + 1900, ti.tm_mon + 1, ti.tm_mday,
+                  ti.tm_hour, ti.tm_min, ti.tm_sec);
+  }
+
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  return true;
+}
+
+static void rtcFormatISO(const DateTime &dt, char *buf, size_t sz)
+{
+  snprintf(buf, sz, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+           dt.year(), dt.month(), dt.day(),
+           dt.hour(), dt.minute(), dt.second());
+}
+
+static void rtcFormatDisplay(const DateTime &dt, char *buf, size_t sz)
+{
+  snprintf(buf, sz, "%02d-%02d %02d:%02d:%02d",
+           dt.month(), dt.day(),
+           dt.hour(), dt.minute(), dt.second());
+}
 
 // baseline
 float vibBaseline = 0.0f;
@@ -522,6 +607,7 @@ f.print("# git_dirty="); f.println(GIT_DIRTY);
   f.print("# start_ms="); f.println(runStartMs);
   f.print("# baseline_valid="); f.println(baselineValidAtRun ? "true" : "false");
   f.print("# baseline_vibrms="); f.println(baselineAtRun, 6);
+  if (runUtcStr[0]) { f.print("# run_utc="); f.println(runUtcStr); }
   f.println("timestamp_ms,ax_mps2,ay_mps2,az_mps2,mag_mps2,vib_inst_mps2,vib_rms_mps2,vib_net_mps2,thr_cmd,esc_us,rpm,vin_v,iin_a,pin_w,energy_wh");
   f.flush();
 }
@@ -627,7 +713,17 @@ bool startLogging()
   }
 
   runStartMs = millis();
-  
+
+  // Capture RTC time once per run
+  if (rtcOk) {
+    DateTime now = rtc.now();
+    rtcFormatISO(now, runUtcStr, sizeof(runUtcStr));
+    runStartEpoch = now.unixtime();
+  } else {
+    runUtcStr[0] = '\0';
+    runStartEpoch = 0;
+  }
+
   // default: manual logging session
   logAutoThisRun = false;
   pendingAutoStop = false;
@@ -699,6 +795,9 @@ baselineAtRun = vibBaseline;
     logJsonWriteKeyValueU32("sketch_size_bytes", sketchSizeB, TFT_CS, SD_CS);
     logJsonWriteKeyValueU32("free_sketch_bytes", freeSketchB, TFT_CS, SD_CS);
     logJsonEndObject(true, TFT_CS, SD_CS);
+
+    if (runUtcStr[0])
+      logJsonWriteKeyValueStr("run_utc", runUtcStr, TFT_CS, SD_CS);
 
     logJsonBeginObject("run", TFT_CS, SD_CS);
     logJsonWriteKeyValueU32("start_ms", runStartMs, TFT_CS, SD_CS);
@@ -814,7 +913,7 @@ static void appendRunSummaryCsv(uint32_t stopMs)
 {
   const char* summaryFile = "/RUN_SUMMARY_SHORT.CSV";
   const char* header =
-    "run,start_ms,stop_ms,duration_ms,test,thr_cmd_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max,vin_max,iin_max,pwr_max,energy_wh";
+    "run,run_utc,start_ms,stop_ms,duration_ms,test,thr_cmd_max,esc_us_max,vib_inst_max,vib_rms_mean,rpm_max,vin_max,iin_max,pwr_max,energy_wh";
 
   const uint32_t durationMs = stopMs - runStartMs;
 
@@ -828,10 +927,11 @@ static void appendRunSummaryCsv(uint32_t stopMs)
   float pwrMax     = st_pin.has ? st_pin.maxv : 0.0f;
   float eRun       = rigSensorsGet().energy_wh - energyAtStart;
 
-  char row[300];
+  char row[340];
   snprintf(row, sizeof(row),
-           "%lu,%lu,%lu,%lu,%s,%.6f,%.0f,%.6f,%.6f,%ld,%.3f,%.3f,%.2f,%.4f",
+           "%lu,%s,%lu,%lu,%lu,%s,%.6f,%.0f,%.6f,%.6f,%ld,%.3f,%.3f,%.2f,%.4f",
            (unsigned long)runNumber,
+           runUtcStr[0] ? runUtcStr : "",
            (unsigned long)runStartMs,
            (unsigned long)stopMs,
            (unsigned long)durationMs,
@@ -883,7 +983,7 @@ void stopLogging()
     s.schema_version = "1";
 
     // Timing / counts
-    s.start_epoch    = 0;
+    s.start_epoch    = runStartEpoch;
     s.start_ms       = runStartMs;
     s.duration_ms    = stopMs - runStartMs;
     s.samples_csv    = logSamplesTotal;
@@ -1441,8 +1541,8 @@ void drawStaticUI()
   tft.print("MOTOR RIG v0.1");
 
   tft.setCursor(8, HEADER_Y2);
-  tft.setTextColor(C_OK, C_BG);
-  tft.print("IMU ONLINE");
+  tft.setTextColor(rtcSynced ? C_OK : C_WARN, C_BG);
+  tft.print(displayTime[0] ? displayTime : "NO RTC");
 
   tft.setCursor(200, HEADER_Y2);
   tft.setTextColor(C_LABEL, C_BG);
@@ -1607,6 +1707,7 @@ void helpMain()
   Serial.println("  sweep tri  --min a --max b --period s --cycles n");
   Serial.println("  esc set --freq Hz");
   Serial.println("  esc calibrate | esc calibrate stop");
+  Serial.println("  time | time sync | time set <iso>");
 }
 
 void helpMotor(){ Serial.println("HELP MOTOR"); }
@@ -1929,6 +2030,74 @@ void handleCliLine(char *line)
     return;
   }
 
+  // TIME commands
+  if (streqi(argv[0], "TIME"))
+  {
+    if (argc == 1) {
+      // Print current RTC time + uptime
+      if (rtcOk) {
+        DateTime now = rtc.now();
+        char iso[28];
+        rtcFormatISO(now, iso, sizeof(iso));
+        Serial.print("TIME utc=");
+        Serial.print(iso);
+        Serial.print(" epoch=");
+        Serial.print(now.unixtime());
+      } else {
+        Serial.print("TIME utc=NONE");
+      }
+      Serial.print(" uptime_ms=");
+      Serial.println(millis());
+      Serial.print("TIME rtc_ok=");
+      Serial.print(rtcOk ? "true" : "false");
+      Serial.print(" synced=");
+      Serial.println(rtcSynced ? "true" : "false");
+      Serial.println("OK");
+      return;
+    }
+
+    if (streqi(argv[1], "SYNC")) {
+      if (argc != 2) { Serial.println("ERR time_sync_syntax"); return; }
+      if (!rtcOk) { Serial.println("ERR rtc_not_available"); return; }
+      bool ok = ntpSync();
+      if (ok) {
+        DateTime now = rtc.now();
+        char iso[28];
+        rtcFormatISO(now, iso, sizeof(iso));
+        Serial.print("OK time_synced utc=");
+        Serial.println(iso);
+      } else {
+        Serial.println("ERR ntp_sync_failed");
+      }
+      return;
+    }
+
+    if (streqi(argv[1], "SET")) {
+      if (argc != 3) { Serial.println("ERR time_set_syntax (time set YYYY-MM-DDTHH:MM:SSZ)"); return; }
+      if (!rtcOk) { Serial.println("ERR rtc_not_available"); return; }
+
+      // Parse ISO 8601: YYYY-MM-DDTHH:MM:SSZ
+      const char *s = argv[2];
+      int yr, mo, dy, hr, mn, sc;
+      if (sscanf(s, "%d-%d-%dT%d:%d:%d", &yr, &mo, &dy, &hr, &mn, &sc) != 6) {
+        Serial.println("ERR bad_iso_format (YYYY-MM-DDTHH:MM:SSZ)");
+        return;
+      }
+      rtc.adjust(DateTime(yr, mo, dy, hr, mn, sc));
+      rtcSynced = true;
+
+      DateTime now = rtc.now();
+      char iso[28];
+      rtcFormatISO(now, iso, sizeof(iso));
+      Serial.print("OK time_set utc=");
+      Serial.println(iso);
+      return;
+    }
+
+    Serial.println("ERR time_syntax (time | time sync | time set <iso>)");
+    return;
+  }
+
   Serial.println("ERR unknown_command");
 }
 
@@ -1979,6 +2148,27 @@ void setup()
 
   // Init INA226 + tach AFTER I2C bus is configured
   rigSensorsBegin();
+
+  // --- RTC init ---
+  if (rtc.begin()) {
+    rtcOk = true;
+    if (rtc.lostPower()) {
+      Serial.println("WARN rtc_lost_power");
+    }
+    // Attempt NTP sync if WiFi creds are configured
+    if (strlen(WIFI_SSID) > 0) {
+      ntpSync();
+    }
+    // Read initial time for display
+    DateTime now = rtc.now();
+    rtcFormatDisplay(now, displayTime, sizeof(displayTime));
+    char isoBuf[28];
+    rtcFormatISO(now, isoBuf, sizeof(isoBuf));
+    Serial.print("RTC time=");
+    Serial.println(isoBuf);
+  } else {
+    Serial.println("ERR rtc_init_fail");
+  }
 
   uint8_t w = 0;
   if (readRegs(0x75, &w, 1)) whoami = w;
@@ -2094,6 +2284,23 @@ static uint32_t ns = micros();
   if ((int32_t)(millis() - nu) >= 0)
   {
     nu += UI_MS;
+
+    // ---- RTC clock on TFT @ ~1Hz ----
+    static uint32_t lastTimeDraw = 0;
+    if (rtcOk && millis() - lastTimeDraw >= 1000) {
+      lastTimeDraw = millis();
+      DateTime now = rtc.now();
+      char newTime[20];
+      rtcFormatDisplay(now, newTime, sizeof(newTime));
+      if (strcmp(newTime, displayTime) != 0) {
+        strncpy(displayTime, newTime, sizeof(displayTime) - 1);
+        displayTime[sizeof(displayTime) - 1] = '\0';
+        tft.setTextSize(2);
+        tft.setCursor(8, HEADER_Y2);
+        tft.setTextColor(rtcSynced ? C_OK : C_WARN, C_BG);
+        printFixedPadded(displayTime, 15);
+      }
+    }
 
     static float ax_d = 999, ay_d = 999, az_d = 999, vi_d = 999, vr_d = 999;
     static bool  sdOk_d = false;  // FIX: proper bool
@@ -2246,6 +2453,28 @@ if (strcmp(motorId, motor_d) != 0)
       strncpy(stat_d, stat, sizeof(stat_d) - 1);
       stat_d[sizeof(stat_d) - 1] = '\0';
       drawMetaLine1Fixed(META_Y0 + 2 * META_LINE + META_PAD, "STAT:", stat_d, 43);
+    }
+  }
+
+  // ---- RTC drift diagnostic (every 60s, Serial only) ----
+  {
+    static uint32_t lastDriftCheck = 0;
+    static uint32_t driftBaseMs = 0;
+    static uint32_t driftBaseEpoch = 0;
+    if (rtcOk && millis() - lastDriftCheck >= 60000) {
+      lastDriftCheck = millis();
+      DateTime now = rtc.now();
+      uint32_t nowEpoch = now.unixtime();
+      if (driftBaseEpoch == 0) {
+        driftBaseMs = millis();
+        driftBaseEpoch = nowEpoch;
+      } else {
+        uint32_t elapsedMs = millis() - driftBaseMs;
+        int32_t elapsedRtcMs = (int32_t)(nowEpoch - driftBaseEpoch) * 1000;
+        int32_t driftMs = (int32_t)elapsedMs - elapsedRtcMs;
+        Serial.printf("DRIFT millis_vs_rtc=%+ldms over %lus\n",
+                      (long)driftMs, (unsigned long)(elapsedMs / 1000));
+      }
     }
   }
 
