@@ -2108,46 +2108,41 @@ static char motor_d[48] = {0};
     const int vx2 = COL2_X + VALUE_XOFF;
     const int vy0 = BODY_Y0;
 
-    const int leftValueW = (COL1_X + COL_W) - vx1;
-    const int valueH = ROW_H;
     const int rightValueWChars = 10;
 
     char buf[24];
 
+    const int leftValueChars = 6;                    // 6 chars × 12px = 72px, fits in 76px zone
+
     if (fabsf(ax - ax_d) > AX_EPS)
     {
       ax_d = ax;
-      clearValueRect2(vx1, vy0 + 0 * ROW_H, leftValueW, valueH);
       snprintf(buf, sizeof(buf), "%.2f", ax_d);
-      drawValueText2(vx1, vy0 + 0 * ROW_H, buf, C_VALUE);
+      drawValueText2Fixed(vx1, vy0 + 0 * ROW_H, buf, leftValueChars, C_VALUE);
     }
     if (fabsf(ay - ay_d) > AX_EPS)
     {
       ay_d = ay;
-      clearValueRect2(vx1, vy0 + 1 * ROW_H, leftValueW, valueH);
       snprintf(buf, sizeof(buf), "%.2f", ay_d);
-      drawValueText2(vx1, vy0 + 1 * ROW_H, buf, C_VALUE);
+      drawValueText2Fixed(vx1, vy0 + 1 * ROW_H, buf, leftValueChars, C_VALUE);
     }
     if (fabsf(az - az_d) > AX_EPS)
     {
       az_d = az;
-      clearValueRect2(vx1, vy0 + 2 * ROW_H, leftValueW, valueH);
       snprintf(buf, sizeof(buf), "%.2f", az_d);
-      drawValueText2(vx1, vy0 + 2 * ROW_H, buf, C_VALUE);
+      drawValueText2Fixed(vx1, vy0 + 2 * ROW_H, buf, leftValueChars, C_VALUE);
     }
     if (fabsf(vibInst - vi_d) > VIB_EPS)
     {
       vi_d = vibInst;
-      clearValueRect2(vx1, vy0 + 3 * ROW_H, leftValueW, valueH);
       snprintf(buf, sizeof(buf), "%.3f", vi_d);
-      drawValueText2(vx1, vy0 + 3 * ROW_H, buf, C_VALUE);
+      drawValueText2Fixed(vx1, vy0 + 3 * ROW_H, buf, leftValueChars, C_VALUE);
     }
     if (fabsf(vibRms - vr_d) > VIB_EPS)
     {
       vr_d = vibRms;
-      clearValueRect2(vx1, vy0 + 4 * ROW_H, leftValueW, valueH);
       snprintf(buf, sizeof(buf), "%.3f", vr_d);
-      drawValueText2(vx1, vy0 + 4 * ROW_H, buf, C_VALUE);
+      drawValueText2Fixed(vx1, vy0 + 4 * ROW_H, buf, leftValueChars, C_VALUE);
     }
 
     if (sdOk != sdOk_d)
