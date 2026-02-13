@@ -7,3 +7,5 @@ Thumbs.db
 RUN*.CSV
 RUN*.JSON
 RUN_SUMMARY.CSV
+.claude/
+nul
