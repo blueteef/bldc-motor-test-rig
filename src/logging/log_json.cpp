@@ -1,5 +1,6 @@
 #include "bldc_rig/logging/log_json.h"
 #include <string.h>
+#include <math.h>
 
 static fs::File gJson;
 
@@ -88,6 +89,7 @@ static void trimTrailingCommaBeforeClose(fs::File &f)
 {
   if (!f) return;
 
+  f.flush();                  // commit buffered writes so size() is accurate
   const size_t n = f.size();
   if (n == 0) return;
 
@@ -125,7 +127,7 @@ bool logJsonOpen(const char* path, int tftCsPin, int sdCsPin)
   gSdCs  = sdCsPin;
 
   spiSelectSd(tftCsPin, sdCsPin);
-  gJson = SD.open(path, FILE_WRITE);
+  gJson = SD.open(path, "w+");  // need read+write so trimTrailingCommaBeforeClose can seek-and-read
 
   if (!gJson)
   {
@@ -156,6 +158,7 @@ void logJsonClose(int tftCsPin, int sdCsPin)
   }
 
   trimTrailingCommaBeforeClose(gJson);
+  gJson.seek(0, SeekEnd);              // ensure we're at EOF after seek/read
   gJson.print("\n}\n");
   gJson.flush();
   gJson.close();
@@ -240,7 +243,10 @@ void logJsonWriteKeyValueF(const char* key, float value, int decimals, int tftCs
   spiSelectSd(tftCsPin, sdCsPin);
 
   writeKeyPrefix(key);
-  gJson.print(value, decimals);
+  if (isnan(value) || isinf(value))
+    gJson.print("null");
+  else
+    gJson.print(value, decimals);
 
   spiDeselectSd(tftCsPin, sdCsPin);
 }
@@ -290,6 +296,7 @@ void logJsonCloseWithStopMs(uint32_t stopMs, int tftCsPin, int sdCsPin)
   }
 
   trimTrailingCommaBeforeClose(gJson);
+  gJson.seek(0, SeekEnd);              // ensure we're at EOF after seek/read
   gJson.print("\n}\n");
   gJson.flush();
   gJson.close();
